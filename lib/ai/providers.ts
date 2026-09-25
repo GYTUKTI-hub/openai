@@ -76,6 +76,24 @@ export const MONO_LOGO_PROVIDERS: ReadonlySet<string> = new Set(['openai', 'open
  * Provider registry
  */
 export const PROVIDERS: Record<ProviderId, ProviderConfig> = {
+ ollama: {
+    id: 'ollama',
+    name: 'Ollama (Local)',
+    type: 'openai',
+    defaultBaseUrl: 'http://localhost:11434/v1',
+    requiresApiKey: false,
+    icon: '/logos/openai.svg',
+    models: [
+      {
+        id: 'llama3',
+        name: 'Llama 3 (Local)',
+        contextWindow: 8192,
+        outputwindow: 2048,
+        capabilities: {
+          streaming: true,
+          tools: true,
+          vision: false,
+        }
   openai: {
     id: 'openai',
     name: 'OpenAI',
