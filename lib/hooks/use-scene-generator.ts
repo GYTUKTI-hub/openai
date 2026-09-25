@@ -1,1210 +1,2117 @@
-'use client';
+/**
+ * Stage 2: Scene content and action generation.
+ *
+ * Generates full scenes (slide/quiz/interactive/pbl with actions)
+ * from scene outlines.
+ */
 
-import { useCallback, useRef } from 'react';
-import { useStageStore } from '@/lib/store/stage';
-import { isSceneEditLocked } from '@/lib/edit/regen-lock';
-import { getCurrentModelConfig, getStageRoutesHeaderValue } from '@/lib/utils/model-config';
-import { useSettingsStore } from '@/lib/store/settings';
-import { db } from '@/lib/utils/database';
+import { nanoid } from 'nanoid';
+import katex from 'katex';
 import type {
-  SceneOutline,
-  PdfImage,
+  Action,
+  PBLProject,
+  PPTElement,
+  QuizQuestion,
+  SlideBackground,
+  WidgetType,
+} from '@openmaic/dsl';
+import { isWidgetType, normalizeElement } from '@openmaic/dsl';
+import { MAX_VISION_IMAGES } from './constants.js';
+import {
+  formatImageDescription,
+  formatImagePlaceholder,
+  partitionImagesForVision,
+} from './outline-formatters.js';
+import type {
   ImageMapping,
+  PdfImage,
+  SceneOutline,
   UserRequirements,
-} from '@/lib/types/generation';
-import type { AgentInfo } from '@openmaic/generation';
-import type { Scene } from '@/lib/types/stage';
-import type { SpeechAction } from '@/lib/types/action';
-import { splitLongSpeechActions } from '@/lib/audio/tts-utils';
-import { measureAudioDuration } from '@/lib/audio/audio-duration';
-import { isTTSProviderEnabled } from '@/lib/audio/provider-enablement';
-import { resolveAgentVoiceOptions, pickNarratorAgent } from '@/lib/audio/agent-voice';
+  WidgetOutline,
+} from './outline-types.js';
+import { DEFAULT_LANGUAGE_DIRECTIVE } from './outline-generator.js';
+import { postProcessInteractiveHtml } from './interactive-post-processor.js';
+import { findInteractiveScriptSyntaxFailure } from './interactive-script-validator.js';
+import { parseActionsFromStructuredOutput } from './action-parser.js';
+import { parseJsonResponse } from './json-repair.js';
 import {
-  getEnabledProvidersWithVoices,
-  resolveDeterministicFallbackVoice,
-  resolveNarratorVoiceBinding,
-  type ResolvedVoice,
-} from '@/lib/audio/voice-resolver';
-import { resolveTTSModelForVoice } from '@/lib/audio/constants';
-import { useAgentRegistry } from '@/lib/orchestration/registry/store';
-import { generateMediaForOutlines } from '@/lib/media/media-orchestrator';
-import { commitToPool } from '@/lib/media/commit-to-pool';
-import { mayGenerateForStage } from '@/lib/classroom/generation-permission';
-import { isServerBackedMediaPersistence } from '@/lib/persistence/media-persistence';
-import { lazyBoundedMap } from '@/lib/utils/concurrency';
-import { createLogger } from '@/lib/logger';
-import { toast } from 'sonner';
-import { getClientTranslation } from '@/lib/i18n';
-import {
-  isVoiceBindingUnavailable,
-  markVoiceBindingNoticeShown,
-  markVoiceBindingUnavailable,
-  voiceBindingKey,
-} from '@/lib/audio/unavailable-voice-bindings';
-import {
-  isAbortError,
-  withGenerationRetry,
-  type GenerationRetryOptions,
-} from '@openmaic/generation/browser';
+  buildCourseContext,
+  formatAgentsForPrompt,
+  formatTeacherPersonaForPrompt,
+} from './prompt-formatters.js';
+import type { PromptId } from './prompts/types.js';
+import { buildPrompt, PROMPT_IDS } from './prompts/index.js';
+import type {
+  GeneratedInteractiveContent,
+  GeneratedPBLContent,
+  GeneratedQuizContent,
+  GeneratedSlideContent,
+  WidgetConfig,
+} from './scene-types.js';
+import type {
+  AgentInfo,
+  SceneGenerationContext,
+  GeneratedSlideData,
+  AICallFn,
+} from './pipeline-types.js';
+import { noopGenerationLogger, type GenerationLogger } from './logger.js';
+import { isAbortError, withGenerationRetry } from './generation-retry.js';
+import { generatePBLV2ProjectSingleCall } from './pbl/planner-single-call.js';
+import { PlannerV2Error } from './pbl/planner-core.js';
+import type { PBLPlannerV2Input } from './pbl/types.js';
 
-const log = createLogger('SceneGenerator');
-
-interface SceneContentResult {
-  success: boolean;
-  content?: unknown;
-  effectiveOutline?: SceneOutline;
-  error?: string;
-  errorCode?: string;
-  statusCode?: number;
+function isGeneratedMediaPlaceholder(value: string | undefined): value is string {
+  return !!value && /^gen_(img|vid)_[\w-]+$/i.test(value);
 }
 
-interface SceneActionsResult {
-  success: boolean;
-  scene?: Scene;
-  previousSpeeches?: string[];
-  error?: string;
-  errorCode?: string;
-  statusCode?: number;
-}
-
-type ClientRetryOptions<T> = Partial<
-  Omit<GenerationRetryOptions<T>, 'label' | 'shouldRetryResult' | 'signal'>
->;
-
-function getApiHeaders(): HeadersInit {
-  const config = getCurrentModelConfig();
-  const settings = useSettingsStore.getState();
-  const imageProviderConfig = settings.imageProvidersConfig?.[settings.imageProviderId];
-  const videoProviderConfig = settings.videoProvidersConfig?.[settings.videoProviderId];
-  const stageRoutesHeader = getStageRoutesHeaderValue();
-
-  return {
-    'Content-Type': 'application/json',
-    ...(stageRoutesHeader ? { 'x-model-routes': stageRoutesHeader } : {}),
-    'x-model': config.modelString || '',
-    'x-api-key': config.apiKey || '',
-    'x-base-url': config.baseUrl || '',
-    'x-provider-type': config.providerType || '',
-    // Image generation provider
-    'x-image-provider': settings.imageProviderId || '',
-    'x-image-model': settings.imageModelId || '',
-    'x-image-api-key': imageProviderConfig?.apiKey || '',
-    'x-image-base-url': imageProviderConfig?.baseUrl || '',
-    // Video generation provider
-    'x-video-provider': settings.videoProviderId || '',
-    'x-video-model': settings.videoModelId || '',
-    'x-video-api-key': videoProviderConfig?.apiKey || '',
-    'x-video-base-url': videoProviderConfig?.baseUrl || '',
-    // Media generation toggles
-    'x-image-generation-enabled': String(settings.imageGenerationEnabled ?? false),
-    'x-video-generation-enabled': String(settings.videoGenerationEnabled ?? false),
-  };
-}
-
-function withThinkingConfig<T extends Record<string, unknown>>(body: T): T {
-  const { thinkingConfig } = getCurrentModelConfig();
-  return thinkingConfig ? ({ ...body, thinkingConfig } as T) : body;
-}
-
-async function readJsonResponse(response: Response): Promise<Record<string, unknown>> {
-  return response.json().catch(() => ({
-    error: response.statusText || 'Request failed',
-  }));
-}
-
-function createHttpError(
-  response: Response,
-  data: { details?: unknown; error?: unknown; errorCode?: unknown },
-  fallback: string,
-): Error & { errorCode?: string; statusCode?: number } {
-  const message =
-    typeof data.details === 'string'
-      ? data.details
-      : typeof data.error === 'string'
-        ? data.error
-        : `${fallback}: HTTP ${response.status}`;
-  const error = new Error(message) as Error & { errorCode?: string; statusCode?: number };
-  if (typeof data.errorCode === 'string') {
-    error.errorCode = data.errorCode;
-  }
-  error.statusCode = response.status;
-  return error;
-}
-
-function messageFromError(error: unknown, fallback: string): string {
-  return error instanceof Error ? error.message : fallback;
-}
-
-function errorMeta(error: unknown): Pick<SceneContentResult, 'errorCode' | 'statusCode'> {
-  if (!error || typeof error !== 'object') return {};
-  const record = error as { errorCode?: unknown; statusCode?: unknown };
-  return {
-    ...(typeof record.errorCode === 'string' ? { errorCode: record.errorCode } : {}),
-    ...(typeof record.statusCode === 'number' ? { statusCode: record.statusCode } : {}),
-  };
-}
-
-/** Call POST /api/generate/scene-content (step 1) */
-export async function fetchSceneContent(
-  params: {
-    outline: SceneOutline;
-    allOutlines: SceneOutline[];
-    stageId: string;
-    pdfImages?: PdfImage[];
-    imageMapping?: ImageMapping;
-    stageInfo: {
-      name: string;
-      description?: string;
-      language?: string;
-      style?: string;
-    };
-    agents?: AgentInfo[];
-    languageDirective?: string;
-    requirements?: Partial<UserRequirements>;
-  },
-  signal?: AbortSignal,
-  retryOptions?: ClientRetryOptions<SceneContentResult>,
-): Promise<SceneContentResult> {
-  try {
-    return await withGenerationRetry(
-      async () => {
-        const response = await fetch('/api/generate/scene-content', {
-          method: 'POST',
-          headers: getApiHeaders(),
-          body: JSON.stringify(withThinkingConfig(params)),
-          signal,
-        });
-
-        const data = await readJsonResponse(response);
-        if (!response.ok) {
-          throw createHttpError(response, data, 'Scene content request failed');
-        }
-
-        return data as unknown as SceneContentResult;
-      },
-      {
-        label: `scene content "${params.outline.title}"`,
-        shouldRetryResult: (result) => !result.success || !result.content,
-        ...retryOptions,
-        signal,
-      },
-    );
-  } catch (error) {
-    if (isAbortError(error)) throw error;
-    return {
-      success: false,
-      error: messageFromError(error, 'Content generation failed'),
-      ...errorMeta(error),
-    };
-  }
-}
-
-/** Call POST /api/generate/scene-actions (step 2) */
-export async function fetchSceneActions(
-  params: {
-    outline: SceneOutline;
-    allOutlines: SceneOutline[];
-    content: unknown;
-    stageId: string;
-    agents?: AgentInfo[];
-    previousSpeeches?: string[];
-    userProfile?: string;
-    languageDirective?: string;
-  },
-  signal?: AbortSignal,
-  retryOptions?: ClientRetryOptions<SceneActionsResult>,
-): Promise<SceneActionsResult> {
-  try {
-    return await withGenerationRetry(
-      async () => {
-        const response = await fetch('/api/generate/scene-actions', {
-          method: 'POST',
-          headers: getApiHeaders(),
-          body: JSON.stringify(withThinkingConfig(params)),
-          signal,
-        });
-
-        const data = await readJsonResponse(response);
-        if (!response.ok) {
-          throw createHttpError(response, data, 'Scene actions request failed');
-        }
-
-        return data as unknown as SceneActionsResult;
-      },
-      {
-        label: `scene actions "${params.outline.title}"`,
-        shouldRetryResult: (result) => !result.success || !result.scene,
-        ...retryOptions,
-        signal,
-      },
-    );
-  } catch (error) {
-    if (isAbortError(error)) throw error;
-    return {
-      success: false,
-      error: messageFromError(error, 'Actions generation failed'),
-      ...errorMeta(error),
-    };
-  }
-}
-
-interface TTSApiResponse {
-  success?: boolean;
-  base64?: string;
-  format?: string;
-  error?: string;
-  details?: string;
-}
-
-// A dead narrator voice is retried at most once against a DIFFERENT voice (the
-// global voice when the binding differs from it, or the deterministic
-// enabled-provider pick when bound == global). This bounds the total
-// /api/generate/tts attempts to 2 per call and guarantees the
-// QWEN_VC_VOICE_NOT_FOUND retry cannot loop a chain of dead voices
-// (bound-dead → global-dead → deterministic-dead → …) forever.
-const MAX_NARRATOR_VOICE_FALLBACK_HOPS = 1;
-
-/** Generate TTS for one speech action and return its allocated asset reference. */
-export async function generateAndStoreTTS(
-  requestId: string,
-  text: string,
-  language?: string,
-  signal?: AbortSignal,
-  retryOptions?: ClientRetryOptions<TTSApiResponse>,
-  existingAudioId?: string,
-  stageId?: string,
-  // Internal: an explicit voice that bypasses narrator binding resolution — used
-  // to retry narration against the deterministic enabled-provider pick when the
-  // pinned narrator voice (bound == global) turns out to be unusable.
-  overrideVoice?: ResolvedVoice,
-  // Internal: number of narrator voice-fallback hops already taken. Guards the
-  // QWEN_VC_VOICE_NOT_FOUND retry so a chain of dead voices can never loop
-  // /api/generate/tts beyond a single fallback hop.
-  fallbackHops = 0,
-): Promise<string | null> {
-  const settings = useSettingsStore.getState();
-  // A generated roster's explicit voice binding is the course voice source of truth.
-  // Global settings remain the fallback for classrooms without a binding.
-  const teacher = pickNarratorAgent(useAgentRegistry.getState().listAgents());
-  const globalProviderConfig = settings.ttsProvidersConfig?.[settings.ttsProviderId];
-  const boundVoice = teacher?.voiceConfig;
-  const boundKey = boundVoice ? voiceBindingKey(boundVoice) : undefined;
-  // The narrator pin makes boundVoice == the global voice. That equality must
-  // not defeat the unavailable-binding fallbacks: when the pinned voice is
-  // unusable (provider disabled, or the clone deleted server-side), fall back
-  // to the deterministic enabled-provider pick with a single non-fatal notice
-  // instead of throwing (QWEN_VC_VOICE_NOT_FOUND) or silently skipping.
-  const globalDiffers =
-    !!boundVoice &&
-    (boundVoice.providerId !== settings.ttsProviderId || boundVoice.voiceId !== settings.ttsVoice);
-  const fallbackForUnusablePin = (): ResolvedVoice | null => {
-    if (!boundVoice) return null;
-    const key = voiceBindingKey(boundVoice);
-    markVoiceBindingUnavailable(boundVoice);
-    if (markVoiceBindingNoticeShown(key)) {
-      toast.warning(getClientTranslation('settings.qwenCloneNarrationUnavailable'));
-    }
-    return resolveDeterministicFallbackVoice(
-      getEnabledProvidersWithVoices(settings.ttsProvidersConfig),
-      0,
-    );
-  };
-
-  let resolvedVoice =
-    overrideVoice ??
-    resolveNarratorVoiceBinding(
-      boundVoice && isVoiceBindingUnavailable(boundVoice) ? undefined : boundVoice,
-      {
-        providerId: settings.ttsProviderId,
-        modelId: globalProviderConfig?.modelId,
-        voiceId: settings.ttsVoice,
-      },
-      settings.ttsProvidersConfig,
-    );
-
-  // Pinned narrator (bound == global) whose provider became disabled:
-  // resolveNarratorVoiceBinding falls back to the global voice, which is the
-  // same broken provider — swap in the deterministic enabled-provider pick
-  // instead of silently skipping narration below.
-  if (
-    boundVoice &&
-    !globalDiffers &&
-    !isTTSProviderEnabled(
-      resolvedVoice.providerId,
-      settings.ttsProvidersConfig?.[resolvedVoice.providerId],
-    )
-  ) {
-    resolvedVoice = fallbackForUnusablePin() ?? resolvedVoice;
-  }
-
-  const ttsProviderId = resolvedVoice.providerId;
-  const ttsVoice = resolvedVoice.voiceId;
-  const ttsProviderConfig = settings.ttsProvidersConfig?.[ttsProviderId];
-  const ttsModelId = resolveTTSModelForVoice(
-    ttsProviderId,
-    ttsVoice,
-    resolvedVoice.modelId ?? ttsProviderConfig?.modelId,
-  );
-
-  if (ttsProviderId === 'browser-native-tts') return null;
-  // Don't server-generate against a disabled/unconfigured provider (#665).
-  if (!isTTSProviderEnabled(ttsProviderId, ttsProviderConfig)) return null;
-
-  // Narration is the teacher's voice — resolve it from the teacher agent profile
-  // through the single resolver (registers + references by id for stable timbre).
-  const providerOptions = await resolveAgentVoiceOptions(teacher, {
-    providerId: ttsProviderId,
-    providerConfig: { ...ttsProviderConfig, modelId: ttsModelId },
-    voiceId: ttsVoice,
-    language,
-  });
-  let data: TTSApiResponse;
-  try {
-    data = await withGenerationRetry(
-      async () => {
-        const response = await fetch('/api/generate/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text,
-            audioId: requestId,
-            ttsProviderId,
-            ttsModelId,
-            ttsVoice,
-            ttsSpeed: settings.ttsSpeed,
-            ttsApiKey: ttsProviderConfig?.apiKey || undefined,
-            // Managed providers resolve their base URL server-side; only send the
-            // client's own base URL (custom providers).
-            ttsBaseUrl:
-              ttsProviderConfig?.baseUrl || ttsProviderConfig?.customDefaultBaseUrl || undefined,
-            ttsProviderOptions: providerOptions,
-          }),
-          signal,
-        });
-
-        const data = (await readJsonResponse(response)) as TTSApiResponse;
-        if (!response.ok) {
-          throw createHttpError(response, data, 'TTS request failed');
-        }
-        return data;
-      },
-      {
-        label: `tts "${requestId}"`,
-        shouldRetryResult: (result) => !result.success || !result.base64 || !result.format,
-        ...retryOptions,
-        signal,
-      },
-    );
-  } catch (error) {
-    const errorCode =
-      error && typeof error === 'object' && 'errorCode' in error
-        ? (error as { errorCode?: unknown }).errorCode
-        : undefined;
-    // Recover from a missing clone only when the attempt that just failed used
-    // the bound binding itself: marking it unavailable makes the resolver fall
-    // back to the global voice, a DIFFERENT voice. When the failure is already
-    // on the global voice (or on the deterministic pick), retrying would hit
-    // the same dead voice — fall through and surface the error instead of
-    // hot-looping /api/generate/tts (bound-dead → global-dead → …). The
-    // fallbackHops bound keeps even pathological chains at a single hop.
-    if (
-      errorCode === 'QWEN_VC_VOICE_NOT_FOUND' &&
-      boundKey &&
-      boundVoice &&
-      fallbackHops < MAX_NARRATOR_VOICE_FALLBACK_HOPS
-    ) {
-      if (voiceBindingKey(resolvedVoice) === boundKey) {
-        markVoiceBindingUnavailable(boundVoice);
-        if (markVoiceBindingNoticeShown(boundKey)) {
-          toast.warning(getClientTranslation('settings.qwenCloneNarrationUnavailable'));
-        }
-        if (globalDiffers) {
-          // The binding is a voice distinct from the global one: retry with the
-          // binding marked unavailable, which makes the resolver fall back to the
-          // global voice.
-          return generateAndStoreTTS(
-            requestId,
-            text,
-            language,
-            signal,
-            retryOptions,
-            existingAudioId,
-            stageId,
-            undefined,
-            fallbackHops + 1,
-          );
-        }
-        // Bound == global (pinned narrator): a retry would hit the same missing
-        // clone, so fall back to the deterministic enabled-provider pick once.
-        // (mark/notice were applied above; the helper's repeat is idempotent.)
-        if (!overrideVoice) {
-          const fallbackVoice = fallbackForUnusablePin();
-          if (fallbackVoice) {
-            return generateAndStoreTTS(
-              requestId,
-              text,
-              language,
-              signal,
-              retryOptions,
-              existingAudioId,
-              stageId,
-              fallbackVoice,
-              fallbackHops + 1,
-            );
-          }
-        }
-      }
-    }
-    throw error;
-  }
-  if (!data.success || !data.base64 || !data.format) {
-    const err = new Error(
-      data.details || data.error || 'TTS request failed: invalid response payload',
-    );
-    log.warn('TTS failed for', requestId, ':', err);
-    throw err;
-  }
-
-  const binary = atob(data.base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  const blob = new Blob([bytes], { type: `audio/${data.format}` });
-  // Measure duration once at store time so video export (#854) can map this
-  // clip onto a timeline without re-decoding. null → leave undefined; the audio
-  // still persists and plays.
-  const duration = measureAudioDuration(bytes, data.format) ?? undefined;
-  /** This clip's local row, under whichever id it is currently known by. */
-  const cachedNarrationRow = (id: string) => ({
-    id,
-    stageId,
-    blob,
-    duration,
-    format: data.format as string,
-    text,
-    voice: ttsVoice,
-    createdAt: Date.now(),
-  });
-  const serverBacked = isServerBackedMediaPersistence();
-  // Browser-only keeps the historical derived key: document and audio share one
-  // lifetime there, and nothing outside this browser reads either.
-  if (!serverBacked) {
-    const audioId = existingAudioId ?? requestId;
-    await db.audioFiles.put(cachedNarrationRow(audioId));
-    return audioId;
-  }
-
-  // Server-backed: the bytes go to the pool and the pool allocates the
-  // identity, so the id the speech action ends up holding names durable audio
-  // rather than this browser's local table. Bytes land BEFORE the caller stamps
-  // the action, so a document can never name narration that was not stored.
-  const outcome = await commitToPool<void>({
-    stageId,
-    // The derived key, which is both what a refusal keeps the bytes under and
-    // what narration adoption reads them back by on a later load.
-    slot: requestId,
-    bytes: blob,
-    mimeType: blob.type,
-    ...(duration === undefined ? {} : { meta: { durationSeconds: duration } }),
-    // The bytes were just bought. A full store must not be what throws them
-    // away: keeping them under the derived key is what lets the next load
-    // re-attempt the upload from cache instead of paying the provider again,
-    // which is the same contract the media pass's retained bytes have had since
-    // it learned to keep them. See the caller's handling below for the other
-    // half of it -- the action has to carry this key for adoption to find them.
-    //
-    // The rejection is NOT swallowed, and that is the point of awaiting it: a
-    // stamp is only safe once the bytes are somewhere that can be read back. A
-    // local table that refuses the row leaves nothing to adopt, so the commit
-    // demotes itself to `failed` and the line goes unvoiced instead of carrying
-    // a derived key that resolves to nothing for the rest of the course's life.
-    retain: async () => {
-      await db.audioFiles.put(cachedNarrationRow(requestId));
-    },
-    // Nothing to write back: the action this narration belongs to is not in the
-    // document yet. The caller stamps it from the id returned here, which is
-    // why this path has no funnel of its own to invent one.
-    writeBack: async () => undefined,
-    // A cache the pool already backs: a failed write costs a re-download, and
-    // the primitive holds that to be best-effort for every caller.
-    mirror: async (assetId) => {
-      await db.audioFiles.put(cachedNarrationRow(assetId));
-    },
-  });
-
-  if (outcome.status === 'stored') return outcome.assetId;
-  if (outcome.status === 'refused-retained') {
-    // The store had no room, and the bytes are kept. The action is stamped with
-    // the derived key they are kept under, exactly as a refused image leaves
-    // its placeholder in the slide: adoption reads that key on the next load,
-    // re-attempts the upload, and writes the allocated id back with no provider
-    // called. Returning null instead would leave the line unvoiced AND the
-    // bytes unreachable, which is paying for the same clip on every attempt.
-    log.warn(
-      `Asset storage is full; keeping the narration for ${requestId} under its derived key.`,
-    );
-    return requestId;
-  }
-  // Storing narration failed for some other reason -- or the bytes could not be
-  // kept -- and neither says anything about whether a later attempt would fit,
-  // so nothing is left under a key a later load would take for adoptable
-  // narration. A scene whose audio cannot be
-  // stored keeps its text and leaves the line unvoiced and retryable, exactly
-  // as an image that cannot be stored leaves its slide; reporting it as a TTS
-  // failure would pause the whole deck at its first slide over one clip's
-  // storage.
-  log.warn('Narration storage failed; leaving the line unvoiced:', outcome.error);
-  return null;
-}
+const INTERACTIVE_WIDGET_ACTIONS = [
+  'widget_highlight',
+  'widget_setState',
+  'widget_annotation',
+  'widget_reveal',
+];
 
 /**
- * Why a fresh clip never replaces the bytes behind an id it is superseding.
- *
- * Regeneration always forks; the caller's `existingAudioId` is deliberately
- * ignored on the server-backed path. Replacing bytes behind a live id requires
- * proof that no other document holds it, and that proof is unavailable by
- * construction once references can leave this browser — asking the pool who
- * else holds an id would be exactly the existence oracle the asset contract
- * forbids, so `proveExclusiveAssetOwnership` fails closed under server-backed
- * persistence and every caller forks. Keeping a branch that can never be taken
- * would only describe a capability this deployment shape does not have.
- *
- * The superseded id is NOT removed either. Nothing at this point has observed
- * the new id reaching a durable document, so deleting the old bytes could leave
- * a still-referenced action pointing at nothing if the save that follows fails;
- * and the exclusivity that would make deletion safe is the same proof that is
- * unavailable. It does not have to be removed here: the save that writes the
- * new id is also the write that stops naming the old one, so the server stamps
- * the superseded entry as it lands and the collector releases it after the
- * grace period, the bytes following after their own. If that save never lands,
- * it is the NEW id that nothing committed, and it expires on
- * `ASSET_PENDING_TTL_MS` — either way regeneration leaves nothing permanent
- * behind.
+ * Retry budget for a single scene-generation LLM call whose result comes back
+ * empty or fails downstream parsing. Free-tier models (Gemini Flash included)
+ * occasionally return an empty body under load or behind a transient safety
+ * filter hiccup; without this, that single empty response used to fail the
+ * whole scene outright (`generateSceneContent` returns `null` → the route
+ * answers `GENERATION_FAILED` → the scene lands in the "failed" bucket the
+ * classroom UI shows as a card the learner must click to retry by hand).
+ * Retrying automatically here, before that failure ever surfaces, is what
+ * removes the manual click for the common transient case.
  */
+const EMPTY_RESPONSE_MAX_RETRIES = 2;
+const EMPTY_RESPONSE_BASE_DELAY_MS = 800;
+const EMPTY_RESPONSE_MAX_DELAY_MS = 6000;
 
 /**
- * Drop the local copies of narration a scene has rolled back.
+ * Calls the model and validates the raw text BEFORE any downstream parsing is
+ * attempted — the empty/invalid response is checked here, not left for
+ * `JSON.parse` or an HTML/action extractor to trip over further down.
  *
- * The pool entry is deliberately left alone. Asset deletion is refused to every
- * browser — the principal it would scope to is shared, so allowing it would let
- * any caller destroy another author's narration — and a rolled-back clip is
- * simply an entry nothing references, waiting for server-side reclamation like
- * any other.
+ * `isUsable` lets each call site decide what "worth keeping" means: a cheap
+ * non-empty check for calls where an empty fallback path already exists
+ * (action generation degrades to `generateDefault*Actions` on its own), or a
+ * full trial-parse for calls where a bad response has no fallback and would
+ * otherwise fail the whole scene (slide/quiz JSON, interactive HTML).
+ *
+ * Never throws for an exhausted retry budget on a *validation* failure — it
+ * returns the last (still-unusable) response text so the existing
+ * `if (!parsed) { onFailure(); return null }` handling downstream is
+ * unchanged. A genuine transport/provider error (network, 5xx, etc.) still
+ * propagates so the caller's existing catch/log behaviour is preserved.
  */
-export async function removeFreshTtsAllocations(assetIds: readonly string[]): Promise<void> {
-  for (const assetId of new Set(assetIds)) {
-    await db.audioFiles.delete(assetId).catch(() => undefined);
-  }
-}
-
-function speechAllocationIds(scene: Scene): string[] {
-  return (scene.actions ?? []).flatMap((action) =>
-    action.type === 'speech' && action.audioId ? [action.audioId] : [],
-  );
-}
-
-/** Generate TTS for all speech actions in a scene. Returns result. */
-export async function generateTTSForScene(
-  scene: Scene,
-  language?: string,
-  signal?: AbortSignal,
-  retryOptions?: ClientRetryOptions<TTSApiResponse>,
-): Promise<{ success: boolean; failedCount: number; error?: string }> {
-  const providerId = useSettingsStore.getState().ttsProviderId;
-  scene.actions = splitLongSpeechActions(scene.actions || [], providerId);
-  const speechActions = scene.actions.filter(
-    (a): a is SpeechAction => a.type === 'speech' && !!a.text,
-  );
-  if (speechActions.length === 0) return { success: true, failedCount: 0 };
-
-  let failedCount = 0;
-  let lastError: string | undefined;
-  const freshAllocations: string[] = [];
-  /**
-   * Actions holding retained bytes rather than a fresh allocation.
-   *
-   * A clip the store refused for want of room comes back under its own derived
-   * key with its bytes kept in the local table. Nothing was allocated, so a
-   * rollback has nothing to reclaim -- and running one anyway would delete the
-   * only copy of audio that is already paid for and unstamp the key adoption
-   * reads it back by, which is the double billing this whole path exists to
-   * stop. A sibling line failing is not a reason to throw them away.
-   */
-  const retainedRefusals = new Set<SpeechAction>();
-  const serverBacked = isServerBackedMediaPersistence();
-
-  // Scene order keeps the provider request correlation label unique. Storage
-  // identity is allocated by the pool and is never derived from this value.
-  const sceneOrder = scene.order;
-
-  /**
-   * Undo this scene's narration, keeping whatever a rollback cannot own.
-   *
-   * Everything in `freshAllocations` was minted for this scene and nothing else
-   * holds it, so its local copy goes. A retained refusal is the exception, and
-   * the only one.
-   */
-  const rollBackFreshNarration = async (): Promise<void> => {
-    await removeFreshTtsAllocations(freshAllocations);
-    for (const action of speechActions) {
-      if (retainedRefusals.has(action)) continue;
-      delete action.audioId;
-    }
-  };
-
-  // Generate + store one action's audio. Failures are counted, not thrown, so
-  // one bad clip never aborts the rest of the scene.
-  const generateOne = async (action: SpeechAction) => {
-    const requestId = `tts_s${sceneOrder}_${action.id}`;
-    try {
-      const assetId = await generateAndStoreTTS(
-        requestId,
-        action.text,
-        language,
-        signal,
-        retryOptions,
-        undefined,
-        scene.stageId,
+async function callAiWithRetry(
+  aiCall: AICallFn,
+  system: string,
+  user: string,
+  images: Array<{ id: string; src: string }> | undefined,
+  isUsable: (response: string) => boolean,
+  label: string,
+  log: GenerationLogger,
+): Promise<string> {
+  // withGenerationRetry only throws on a genuine transport/provider error or
+  // an abort. When every attempt merely fails `shouldRetryResult` (still
+  // empty/unusable after the retry budget), it resolves to the LAST attempt's
+  // result rather than throwing — so this function always resolves to a
+  // response string, and the existing `if (!parsed) { onFailure(); return
+  // null }` handling at each call site is unchanged for that case.
+  return withGenerationRetry(() => aiCall(system, user, images), {
+    label,
+    maxRetries: EMPTY_RESPONSE_MAX_RETRIES,
+    baseDelayMs: EMPTY_RESPONSE_BASE_DELAY_MS,
+    maxDelayMs: EMPTY_RESPONSE_MAX_DELAY_MS,
+    shouldRetryResult: (response) => !isUsable(response),
+    onRetry: ({ attempt, maxAttempts, nextDelayMs, reason }) => {
+      log.warn(
+        `[${label}] Empty or unusable model response (attempt ${attempt}/${maxAttempts}), ` +
+          `retrying in ${nextDelayMs}ms: ${reason}`,
       );
-      if (assetId) {
-        action.audioId = assetId;
-        // Under server-backed persistence the pool answers with an allocated
-        // id, so the request key coming back means one thing only: the store
-        // refused these bytes and they were kept under it. Browser-only always
-        // returns the request key and always rolls back with the scene, which
-        // is right there -- the bytes and the document share one lifetime.
-        if (serverBacked && assetId === requestId) retainedRefusals.add(action);
-        else freshAllocations.push(assetId);
-      }
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-
-      failedCount++;
-      lastError = error instanceof Error ? error.message : `TTS failed for action ${action.id}`;
-      log.warn('TTS generation failed:', {
-        providerId,
-        actionId: action.id,
-        sceneOrder,
-        requestId,
-        textLength: action.text.length,
-        error: lastError,
-      });
-    }
-  };
-
-  // #660 follow-up: speech actions within a scene are independent — each renders
-  // its own audio under its own audioId, with no cross-action ordering — so when
-  // the server opts into parallel generation, render them with bounded
-  // concurrency (reusing the PARALLEL_SCENE_CONCURRENCY knob) instead of one at a
-  // time. Default (0 / unset) keeps the original strictly-serial behaviour.
-  const ttsConcurrency = Math.max(
-    0,
-    Math.floor(useSettingsStore.getState().parallelSceneConcurrency ?? 0),
-  );
-  try {
-    if (ttsConcurrency > 1 && speechActions.length > 1) {
-      const settled = await Promise.allSettled(
-        lazyBoundedMap(speechActions, ttsConcurrency, generateOne),
-      );
-      const rejected = settled.find(
-        (result): result is PromiseRejectedResult => result.status === 'rejected',
-      );
-      if (rejected) throw rejected.reason;
-    } else {
-      for (const action of speechActions) {
-        await generateOne(action);
-      }
-    }
-  } catch (error) {
-    await rollBackFreshNarration();
-    throw error;
-  }
-
-  if (failedCount > 0) {
-    await rollBackFreshNarration();
-  }
-
-  return {
-    success: failedCount === 0,
-    failedCount,
-    error: lastError,
-  };
+    },
+  });
 }
 
-export interface UseSceneGeneratorOptions {
-  onSceneGenerated?: (scene: Scene, index: number) => void;
-  onSceneFailed?: (outline: SceneOutline, error: string) => void;
-  onPhaseChange?: (phase: 'content' | 'actions', outline: SceneOutline) => void;
-  onComplete?: () => void;
+// ── Options interfaces for scene generation functions ──
+
+export type SceneContentFailureCode = 'prompt-unavailable' | 'invalid-model-output';
+
+export interface SceneContentFailure {
+  code: SceneContentFailureCode;
 }
 
-export interface GenerationParams {
-  pdfImages?: PdfImage[];
+export interface SceneContentOptions {
+  assignedImages?: PdfImage[];
   imageMapping?: ImageMapping;
-  stageInfo: {
-    name: string;
-    description?: string;
-    language?: string;
-    style?: string;
-  };
+  visionEnabled?: boolean;
+  generatedMediaMapping?: ImageMapping;
+  /**
+   * Pre-resolved bytes for the vision slice (RFC #1153 part 2, N3). The app's
+   * scene-content route resolves the slice's allocated asset ids server-side
+   * BEFORE calling the generator so the attachment bytes are settled before
+   * prompt assembly; when provided, the LLM message's vision images are built
+   * from these (matched to the slice ids), so the caller's aiCall resolution
+   * becomes a defensive no-op. Absent (package consumers, browser-backed
+   * runs), the srcs are derived from `imageMapping` exactly as before.
+   */
+  resolvedVisionImages?: Array<{ id: string; src: string; width?: number; height?: number }>;
+  agents?: AgentInfo[];
+  languageDirective?: string;
+  /** Authoritative UI locale selected by the user, consumed by the PBL v2 planner. */
+  targetLanguage?: string;
+  /** Original course request/profile, used by PBL v2 for explicit learner-level signals. */
+  userRequirements?: UserRequirements;
+  allowProceduralSkill?: boolean;
+  /**
+   * Natural-language edit instruction for whole-slide regeneration (MAIC Editor
+   * agent `regenerate_scene`). When set, the slide content prompt switches to
+   * EDIT MODE. slide-only; ignored by other scene types.
+   */
+  editDirective?: string;
+  /**
+   * The current slide content, fed as the edit baseline so content-specific
+   * instructions operate on the real slide rather than re-rolling from outline.
+   * Only consumed by the slide branch alongside `editDirective`.
+   */
+  baselineContent?: GeneratedSlideContent;
+  /** Optional host fallback for the app-only loop planner. */
+  pblLoopFallback?: (input: PBLPlannerV2Input) => Promise<PBLProject>;
+  onFailure?: (failure: SceneContentFailure) => void;
+  logger?: GenerationLogger;
+}
+
+export interface SceneActionsOptions {
+  ctx?: SceneGenerationContext;
   agents?: AgentInfo[];
   userProfile?: string;
   languageDirective?: string;
-  /** Vocational task-engine flag; gates procedural-skill generation server-side (see resolveVocationalActive). */
-  taskEngineMode?: boolean;
+  logger?: GenerationLogger;
 }
 
-export function useSceneGenerator(options: UseSceneGeneratorOptions = {}) {
-  const abortRef = useRef(false);
-  const generatingRef = useRef(false);
-  const mediaAbortRef = useRef<AbortController | null>(null);
-  const fetchAbortRef = useRef<AbortController | null>(null);
-  const lastParamsRef = useRef<GenerationParams | null>(null);
-  const generateRemainingRef = useRef<((params: GenerationParams) => Promise<void>) | null>(null);
+// ==================== Backward Compatibility Helpers ====================
 
-  const store = useStageStore;
+/**
+ * Convert legacy interactiveConfig to unified widget fields
+ * For backward compatibility with old classrooms
+ */
+function convertInteractiveConfigToWidget(
+  outline: SceneOutline,
+  log: GenerationLogger,
+): SceneOutline {
+  const config = outline.interactiveConfig;
+  if (!config) {
+    log.warn(
+      `Interactive outline missing both widget and interactiveConfig, falling back to simulation`,
+    );
+    return {
+      ...outline,
+      widgetType: 'simulation' as WidgetType,
+      widgetOutline: { concept: outline.title },
+    };
+  }
 
-  const generateRemaining = useCallback(
-    async (params: GenerationParams) => {
-      lastParamsRef.current = params;
-      if (generatingRef.current) return;
-      generatingRef.current = true;
-      abortRef.current = false;
-      const removeGeneratingOutline = (outlineId: string) => {
-        const current = store.getState().generatingOutlines;
-        if (!current.some((o) => o.id === outlineId)) return;
-        store.getState().setGeneratingOutlines(current.filter((o) => o.id !== outlineId));
-      };
+  const widgetType = inferWidgetType(
+    config.subject || '',
+    config.conceptName,
+    config.designIdea || '',
+  );
 
-      // Create a new AbortController for this generation run
-      fetchAbortRef.current = new AbortController();
-      const signal = fetchAbortRef.current.signal;
+  log.info(`Converting interactiveConfig to widget: ${widgetType} for "${outline.title}"`);
 
-      const state = store.getState();
-      const { outlines, scenes, stage } = state;
-      const startEpoch = state.generationEpoch;
-      if (!stage || outlines.length === 0) {
-        generatingRef.current = false;
-        return;
-      }
+  return {
+    ...outline,
+    widgetType,
+    widgetOutline: buildWidgetOutline(widgetType, config),
+  };
+}
 
-      store.getState().setGenerationStatus('generating');
+/**
+ * Infer widget type from concept characteristics
+ */
+function inferWidgetType(subject: string, concept: string, designIdea: string): WidgetType {
+  const text = (subject + ' ' + concept + ' ' + designIdea).toLowerCase();
 
-      // Determine pending outlines
-      const completedOrders = new Set(scenes.map((s) => s.order));
-      const pending = outlines
-        .filter((o) => !completedOrders.has(o.order))
-        .sort((a, b) => a.order - b.order);
+  // Rule-based inference
+  if (
+    /physics|chemistry|力学|化学|运动|反应|force|motion|equilibrium|wave|电路|circuit/.test(text)
+  ) {
+    return 'simulation';
+  }
+  if (/programming|code|algorithm|编程|算法|python|javascript|function|代码/.test(text)) {
+    return 'code';
+  }
+  if (/process|workflow|步骤|流程|逻辑|step|flow|系统|system/.test(text)) {
+    return 'diagram';
+  }
+  if (
+    /biology|anatomy|cell|molecular|生物|细胞|分子|3d|三维|solar|planet|skeleton|organ/.test(text)
+  ) {
+    return 'visualization3d';
+  }
+  if (/game|quiz|practice|练习|游戏|puzzle|match|challenge|挑战/.test(text)) {
+    return 'game';
+  }
 
-      if (pending.length === 0) {
-        store.getState().setGenerationStatus('completed');
-        store.getState().setGeneratingOutlines([]);
-        store.getState().setGenerationComplete(true);
-        options.onComplete?.();
-        generatingRef.current = false;
-        return;
-      }
+  // Default fallback
+  return 'simulation';
+}
 
-      store.getState().setGeneratingOutlines(pending);
+/**
+ * Build widgetOutline from interactiveConfig for backward compatibility
+ */
+function buildWidgetOutline(
+  widgetType: WidgetType,
+  config: { conceptName: string; conceptOverview: string; designIdea: string },
+): WidgetOutline {
+  const base: WidgetOutline = { concept: config.conceptName };
 
-      // Launch media generation in parallel — does not block content/action generation.
-      // Under server-backed persistence, abort whatever the ref held first:
-      // replacing it would orphan that loop with a signal nothing can ever
-      // fire, leaving it calling providers and storing assets — real spend and
-      // real storage — for a course the user may already have left, and leaving
-      // `stop()` able to reach only the newest pass. The orchestrator then
-      // waits for the aborted pass to settle before collecting, so the two
-      // never overlap. Browser-only mode keeps its original behaviour, where an
-      // overlapping pass costs a duplicate download and nothing else.
-      if (isServerBackedMediaPersistence()) mediaAbortRef.current?.abort();
-      mediaAbortRef.current = new AbortController();
-      generateMediaForOutlines(outlines, stage.id, mediaAbortRef.current.signal).catch((err) => {
-        log.warn('Media generation error:', err);
-      });
+  switch (widgetType) {
+    case 'simulation':
+      // Try to extract variables from designIdea
+      const varMatch = config.designIdea.match(/variables|参数|调整|adjust|slider/i);
+      return { ...base, keyVariables: varMatch ? [] : undefined };
+    case 'diagram':
+      return { ...base, diagramType: 'flowchart' };
+    case 'code':
+      return { ...base, language: 'python' };
+    case 'game':
+      return { ...base, gameType: 'quiz' };
+    case 'visualization3d':
+      return { ...base, visualizationType: 'custom', objects: [] };
+    default:
+      return base;
+  }
+}
 
-      // Get previousSpeeches from last completed scene
-      let previousSpeeches: string[] = [];
-      const sortedScenes = [...scenes].sort((a, b) => a.order - b.order);
-      if (sortedScenes.length > 0) {
-        const lastScene = sortedScenes[sortedScenes.length - 1];
-        previousSpeeches = (lastScene.actions || [])
-          .filter((a): a is SpeechAction => a.type === 'speech')
-          .map((a) => a.text);
-      }
+/**
+ * Step 3.1: Generate content based on outline
+ */
+export async function generateSceneContent(
+  outline: SceneOutline,
+  aiCall: AICallFn,
+  options: SceneContentOptions = {},
+): Promise<
+  | GeneratedSlideContent
+  | GeneratedQuizContent
+  | GeneratedInteractiveContent
+  | GeneratedPBLContent
+  | null
+> {
+  const log = options.logger ?? noopGenerationLogger;
+  const {
+    assignedImages,
+    imageMapping,
+    visionEnabled,
+    generatedMediaMapping,
+    resolvedVisionImages,
+    agents,
+    languageDirective,
+    targetLanguage,
+    userRequirements,
+    allowProceduralSkill = false,
+    editDirective,
+    baselineContent,
+  } = options;
 
-      // #572: opt-in parallel content fetch. Concurrency is server-configured
-      // (PARALLEL_SCENE_CONCURRENCY), default 0 = off, so out-of-box behaviour is
-      // unchanged.
-      const parallelConcurrency = Math.max(
-        0,
-        // Belt-and-suspenders: the value is already clamped server-side and again
-        // in the settings store; re-clamp here so a stale/garbage store value can
-        // never spawn an unbounded fetch fan-out.
-        Math.floor(useSettingsStore.getState().parallelSceneConcurrency ?? 0),
+  // Unified path for interactive scenes (both normal and ultra mode)
+  if (outline.type === 'interactive') {
+    // Backward compatibility: convert legacy interactiveConfig
+    if (!outline.widgetType && outline.interactiveConfig) {
+      log.info(`Converting legacy interactiveConfig for: ${outline.title}`);
+      outline = convertInteractiveConfigToWidget(outline, log);
+    }
+
+    // If still no widgetType after conversion, fallback to simulation
+    if (!outline.widgetType) {
+      log.warn(
+        `Interactive outline "${outline.title}" has no widgetType, falling back to simulation`,
       );
-      const useParallelContent = parallelConcurrency > 1 && pending.length > 1;
-
-      // Pipelined generation loop (#572). When parallelism is on, scene *content*
-      // fetches are kicked off up front with bounded concurrency (lazyBoundedMap)
-      // but CONSUMED IN ORDER inside the serial loop below — there is no barrier.
-      // So the first scene paints after content(1)+actions(1)+TTS(1) (same as
-      // serial) while later content fetches run hidden behind earlier scenes'
-      // actions/TTS. Content has no cross-scene dependency, so running it ahead is
-      // safe; actions + TTS stay strictly serial to preserve previousSpeeches
-      // threading and the pause-on-failure UX. With parallelism off this is exactly
-      // the original one-at-a-time loop.
-      try {
-        const fetchContent = (outline: SceneOutline) =>
-          fetchSceneContent(
-            {
-              outline,
-              allOutlines: outlines,
-              stageId: stage.id,
-              pdfImages: params.pdfImages,
-              imageMapping: params.imageMapping,
-              stageInfo: params.stageInfo,
-              agents: params.agents,
-              languageDirective: params.languageDirective,
-              ...(params.taskEngineMode ? { requirements: { taskEngineMode: true } } : {}),
-            },
-            signal,
-          );
-
-        // Pre-warm content fetches (<= parallelConcurrency in flight), keyed by
-        // outline id. Each promise resolves to a result and never rejects, so an
-        // unexpected throw routes through the same mark-failed path as the serial
-        // loop instead of taking sibling fetches down with it.
-        const contentPromises = useParallelContent
-          ? new Map(
-              lazyBoundedMap(
-                pending,
-                parallelConcurrency,
-                async (outline): Promise<SceneContentResult> => {
-                  options.onPhaseChange?.('content', outline);
-                  try {
-                    return await fetchContent(outline);
-                  } catch (err) {
-                    return {
-                      success: false,
-                      error: err instanceof Error ? err.message : 'Content generation failed',
-                    };
-                  }
-                },
-                {
-                  shouldContinue: () =>
-                    !abortRef.current && store.getState().generationEpoch === startEpoch,
-                },
-              ).map((promise, i) => [pending[i].id, promise] as const),
-            )
-          : null;
-
-        let pausedByFailureOrAbort = false;
-        let hadContentFailure = false;
-        for (const outline of pending) {
-          if (abortRef.current || store.getState().generationEpoch !== startEpoch) {
-            store.getState().setGenerationStatus('paused');
-            pausedByFailureOrAbort = true;
-            break;
-          }
-
-          store.getState().setCurrentGeneratingOrder(outline.order);
-
-          // Step 1: content — await this outline's pre-warmed fetch (parallel),
-          // which usually resolved while the previous scene's actions/TTS ran; or
-          // fetch it now (serial).
-          let contentResult: SceneContentResult;
-          if (contentPromises) {
-            contentResult = (await contentPromises.get(outline.id)) ?? {
-              success: false,
-              error: 'Content generation failed',
-            };
-          } else {
-            options.onPhaseChange?.('content', outline);
-            contentResult = await fetchContent(outline);
-          }
-
-          if (!contentResult.success || !contentResult.content) {
-            if (abortRef.current || store.getState().generationEpoch !== startEpoch) {
-              pausedByFailureOrAbort = true;
-              break;
-            }
-            store.getState().addFailedOutline(outline);
-            options.onSceneFailed?.(outline, contentResult.error || 'Content generation failed');
-            if (contentPromises) {
-              // Parallel: surface the failure but keep going with the other scenes
-              // (their content is already in flight).
-              hadContentFailure = true;
-              removeGeneratingOutline(outline.id);
-              continue;
-            }
-            // Serial: pause the batch (unchanged behaviour).
-            store.getState().setGenerationStatus('paused');
-            pausedByFailureOrAbort = true;
-            break;
-          }
-
-          if (abortRef.current || store.getState().generationEpoch !== startEpoch) {
-            store.getState().setGenerationStatus('paused');
-            pausedByFailureOrAbort = true;
-            break;
-          }
-
-          // Step 2: Generate actions + assemble scene
-          options.onPhaseChange?.('actions', outline);
-          const actionsResult = await fetchSceneActions(
-            {
-              outline: contentResult.effectiveOutline || outline,
-              allOutlines: outlines,
-              content: contentResult.content,
-              stageId: stage.id,
-              agents: params.agents,
-              previousSpeeches,
-              userProfile: params.userProfile,
-              languageDirective: params.languageDirective,
-            },
-            signal,
-          );
-
-          if (actionsResult.success && actionsResult.scene) {
-            const scene = actionsResult.scene;
-            const settings = useSettingsStore.getState();
-
-            // TTS generation — failure means the whole scene fails
-            if (
-              settings.ttsEnabled &&
-              settings.ttsProviderId !== 'browser-native-tts' &&
-              isTTSProviderEnabled(
-                settings.ttsProviderId,
-                settings.ttsProvidersConfig?.[settings.ttsProviderId],
-              )
-            ) {
-              const ttsResult = await generateTTSForScene(
-                scene,
-                params.languageDirective || params.stageInfo.language,
-                signal,
-              );
-              if (!ttsResult.success) {
-                if (abortRef.current || store.getState().generationEpoch !== startEpoch) {
-                  pausedByFailureOrAbort = true;
-                  break;
-                }
-                store.getState().addFailedOutline(outline);
-                options.onSceneFailed?.(outline, ttsResult.error || 'TTS generation failed');
-                store.getState().setGenerationStatus('paused');
-                pausedByFailureOrAbort = true;
-                break;
-              }
-            }
-
-            // Epoch changed — stage switched, discard this scene
-            if (store.getState().generationEpoch !== startEpoch) {
-              await removeFreshTtsAllocations(speechAllocationIds(scene));
-              pausedByFailureOrAbort = true;
-              break;
-            }
-
-            removeGeneratingOutline(outline.id);
-            useStageStore.getState().addScene(scene);
-            options.onSceneGenerated?.(scene, outline.order);
-            previousSpeeches = actionsResult.previousSpeeches || [];
-          } else {
-            if (abortRef.current || store.getState().generationEpoch !== startEpoch) {
-              pausedByFailureOrAbort = true;
-              break;
-            }
-            store.getState().addFailedOutline(outline);
-            options.onSceneFailed?.(outline, actionsResult.error || 'Actions generation failed');
-            store.getState().setGenerationStatus('paused');
-            pausedByFailureOrAbort = true;
-            break;
-          }
-        }
-
-        if (!abortRef.current && !pausedByFailureOrAbort) {
-          if (hadContentFailure) {
-            // Parallel content phase left some outlines failed but kept going;
-            // surface them for retry instead of signalling a clean completion.
-            store.getState().setGenerationStatus('paused');
-          } else {
-            store.getState().setGenerationStatus('completed');
-            store.getState().setGeneratingOutlines([]);
-            store.getState().setGenerationComplete(true);
-            options.onComplete?.();
-          }
-        }
-      } catch (err: unknown) {
-        // AbortError is expected when stop() is called — don't treat as failure
-        if (isAbortError(err)) {
-          log.info('Generation aborted');
-          store.getState().setGenerationStatus('paused');
-        } else {
-          throw err;
-        }
-      } finally {
-        generatingRef.current = false;
-        fetchAbortRef.current = null;
-      }
-    },
-    [options, store],
-  );
-
-  // Keep ref in sync so retrySingleOutline can call it
-  generateRemainingRef.current = generateRemaining;
-
-  const stop = useCallback(() => {
-    abortRef.current = true;
-    store.getState().bumpGenerationEpoch();
-    fetchAbortRef.current?.abort();
-    mediaAbortRef.current?.abort();
-  }, [store]);
-
-  const isGenerating = useCallback(() => generatingRef.current, []);
-
-  /** Retry a single failed outline from scratch (content → actions → TTS). */
-  const retrySingleOutline = useCallback(
-    async (outlineId: string) => {
-      const state = store.getState();
-      const outline = state.failedOutlines.find((o) => o.id === outlineId);
-      const params = lastParamsRef.current;
-      if (!outline || !state.stage || !params) return;
-      // A whole-outline retry runs content, actions and narration on the
-      // operator's keys. The surfaces already withhold the affordance when
-      // generation is not permitted; refusing here keeps the precondition and
-      // the render condition one rule.
-      if (!mayGenerateForStage(state.stage.id)) return;
-      const retryEpoch = state.generationEpoch;
-
-      // Regen-lock (#571): never silently replace a scene that is open in
-      // edit mode. Failed outlines have no completed scene yet so this is
-      // structurally a no-op today, but the guard is in place for the
-      // moment a "regenerate a successful scene" path routes through here.
-      const lockedScene = state.scenes.find((s) => s.order === outline.order);
-      if (
-        lockedScene &&
-        isSceneEditLocked({
-          sceneId: lockedScene.id,
-          mode: state.mode,
-          currentSceneId: state.currentSceneId,
-        })
-      ) {
-        return;
-      }
-
-      const removeGeneratingOutline = () => {
-        const current = store.getState().generatingOutlines;
-        if (!current.some((o) => o.id === outlineId)) return;
-        store.getState().setGeneratingOutlines(current.filter((o) => o.id !== outlineId));
+      outline = {
+        ...outline,
+        widgetType: 'simulation' as WidgetType,
+        widgetOutline: { concept: outline.title },
       };
+    }
 
-      // Remove from failed list and mark as generating
-      store.getState().retryFailedOutline(outlineId);
-      store.getState().setGenerationStatus('generating');
-      const currentGenerating = store.getState().generatingOutlines;
-      if (!currentGenerating.some((o) => o.id === outline.id)) {
-        store.getState().setGeneratingOutlines([...currentGenerating, outline]);
+    // Route to widget generation (handles all 5 types)
+    return generateWidgetContent(outline, aiCall, languageDirective, {
+      allowProceduralSkill,
+      logger: log,
+      onFailure: options.onFailure,
+    });
+  }
+
+  switch (outline.type) {
+    case 'slide':
+      return generateSlideContent(
+        outline,
+        aiCall,
+        assignedImages,
+        imageMapping,
+        visionEnabled,
+        generatedMediaMapping,
+        resolvedVisionImages,
+        agents,
+        languageDirective,
+        editDirective,
+        baselineContent,
+        log,
+        options.onFailure,
+      );
+    case 'quiz':
+      return generateQuizContent(outline, aiCall, languageDirective, log, options.onFailure);
+    case 'pbl':
+      return generatePBLSceneContent(
+        outline,
+        aiCall,
+        languageDirective,
+        targetLanguage,
+        userRequirements,
+        options.pblLoopFallback,
+        log,
+      );
+    default:
+      return null;
+  }
+}
+
+/**
+ * Check if a string looks like an image ID (e.g., "img_1", "img_2")
+ * rather than a base64 data URL or actual URL
+ *
+ * This function distinguishes between:
+ * - Image IDs: "img_1", "img_2", etc. → returns true
+ * - Base64 data URLs: "data:image/..." → returns false
+ * - HTTP URLs: "http://...", "https://..." → returns false
+ * - Relative paths: "/images/..." → returns false
+ */
+function isImageIdReference(value: string): boolean {
+  if (!value) return false;
+  // Exclude real URLs and paths
+  if (value.startsWith('data:')) return false;
+  if (value.startsWith('http://') || value.startsWith('https://')) return false;
+  if (value.startsWith('/')) return false; // Relative paths
+  // Match image ID format: img_1, img_2, etc.
+  return /^img_\d+$/i.test(value);
+}
+
+/**
+ * Resolve image ID references in src field to the mapping's payload.
+ *
+ * AI generates: { type: "image", src: "img_1", ... }
+ * This function replaces: { type: "image", src: "<imageMapping[src]>", ... }
+ *
+ * Design rationale (Plan B):
+ * - Simpler: AI only needs to know one field (src)
+ * - Consistent: Generated JSON structure matches final PPTImageElement
+ * - Intuitive: src is the image source, first as ID then as actual URL
+ * - Less prompt complexity: No need to explain imageId vs src distinction
+ *
+ * The mapping VALUE is written verbatim, so the transport is decided entirely
+ * by the caller's `imageMapping` shape — no flag threading into this package
+ * (RFC #1153 part 2 B): a browser-backed mapping carries base64 data URLs and
+ * the element src becomes the data URL exactly as before; a server-backed
+ * mapping carries allocated pool asset ids and the element src becomes the
+ * asset id, which the renderer resolves through the pool registry.
+ */
+export function resolveImageIds(
+  elements: GeneratedSlideData['elements'],
+  imageMapping?: ImageMapping,
+  generatedMediaMapping?: ImageMapping,
+  log: GenerationLogger = noopGenerationLogger,
+): GeneratedSlideData['elements'] {
+  return elements
+    .map((el) => {
+      if (el.type === 'image') {
+        if (!('src' in el)) {
+          log.warn(`Image element missing src, removing element`);
+          return null; // Remove invalid image elements
+        }
+        const src = el.src as string;
+
+        // If src is an image ID reference, replace with actual URL
+        if (isImageIdReference(src)) {
+          if (!imageMapping || !imageMapping[src]) {
+            log.warn(`No mapping for image ID: ${src}, removing element`);
+            return null; // Remove invalid image elements
+          }
+          log.debug(`Resolved image ID "${src}" to its mapped source`);
+          return { ...el, src: imageMapping[src] };
+        }
+
+        // Generated image reference — keep as placeholder for async backfill
+        if (isGeneratedMediaPlaceholder(src)) {
+          if (generatedMediaMapping && generatedMediaMapping[src]) {
+            log.debug(`Resolved generated image ID "${src}" to URL`);
+            return { ...el, src: generatedMediaMapping[src] };
+          }
+          // Keep element with placeholder ID — frontend renders skeleton
+          log.debug(`Keeping generated image placeholder: ${src}`);
+          return el;
+        }
       }
 
-      const abortController = new AbortController();
-      const signal = abortController.signal;
+      if (el.type === 'video') {
+        const mediaRef = (el as Record<string, unknown>).mediaRef;
+        if (!('src' in el) && typeof mediaRef !== 'string') {
+          log.warn(`Video element missing src, removing element`);
+          return null;
+        }
+        const src = el.src as string;
+        if (isGeneratedMediaPlaceholder(src)) {
+          if (generatedMediaMapping && generatedMediaMapping[src]) {
+            log.debug(`Resolved generated video ID "${src}" to URL`);
+            return { ...el, src: generatedMediaMapping[src] };
+          }
+          // Keep element with placeholder ID — frontend renders skeleton
+          log.debug(`Keeping generated video placeholder: ${src}`);
+          return el;
+        }
+      }
 
+      return el;
+    })
+    .filter((el): el is NonNullable<typeof el> => el !== null);
+}
+
+function normalizeGeneratedVideoRefs(
+  elements: GeneratedSlideData['elements'],
+  generatedVideoEntries: SceneOutline['mediaGenerations'] = [],
+  log: GenerationLogger = noopGenerationLogger,
+): GeneratedSlideData['elements'] {
+  const validRefs = generatedVideoEntries
+    .filter((mg) => mg.type === 'video')
+    .map((mg) => mg.elementId);
+
+  const validRefSet = new Set(validRefs);
+  const onlyRef = validRefs.length === 1 ? validRefs[0] : undefined;
+
+  return elements
+    .map((el) => {
+      if (el.type !== 'video') return el;
+
+      const videoEl = { ...el } as Record<string, unknown>;
+      const mediaRef = typeof videoEl.mediaRef === 'string' ? videoEl.mediaRef : undefined;
+      const src = typeof videoEl.src === 'string' ? videoEl.src : undefined;
+      const hasGeneratedSrc = isGeneratedMediaPlaceholder(src);
+      const hasDirectSrc = !!src && !hasGeneratedSrc;
+
+      if (hasDirectSrc) {
+        if (mediaRef) delete videoEl.mediaRef;
+        return videoEl as typeof el;
+      }
+
+      if (mediaRef && validRefSet.has(mediaRef)) {
+        if (hasGeneratedSrc) delete videoEl.src;
+        return videoEl as typeof el;
+      }
+
+      if (src && validRefSet.has(src)) {
+        videoEl.mediaRef = src;
+        delete videoEl.src;
+        return videoEl as typeof el;
+      }
+
+      if ((mediaRef || hasGeneratedSrc) && onlyRef) {
+        log.warn(`Correcting generated video reference "${mediaRef || src}" to "${onlyRef}"`);
+        videoEl.mediaRef = onlyRef;
+        if (hasGeneratedSrc) delete videoEl.src;
+        return videoEl as typeof el;
+      }
+
+      if (mediaRef || hasGeneratedSrc) {
+        log.warn(`Invalid generated video reference "${mediaRef || src}", removing element`);
+        return null;
+      }
+
+      return el;
+    })
+    .filter((el): el is NonNullable<typeof el> => el !== null);
+}
+
+/**
+ * Fill required element fields the model may have left off, plus image
+ * aspect-ratio reconciliation.
+ *
+ * The default-filling / geometry-derivation / malformed-input coercion is now
+ * owned by the DSL contract — `normalizeElement` from `@openmaic/dsl` — rather
+ * than duplicated imperatively here (it fills the same canonical defaults,
+ * derives a line's `start`/`end` and a shape's `viewBox`/`path` from the box,
+ * and fails loud on a present-but-wrong-typed field instead of silently
+ * resetting it). Image aspect-ratio reconciliation stays here: it depends on the
+ * resolved PDF asset's real dimensions, which is producer-specific data the DSL
+ * deliberately does not own.
+ */
+function fixElementDefaults(
+  elements: GeneratedSlideData['elements'],
+  assignedImages?: PdfImage[],
+  log: GenerationLogger = noopGenerationLogger,
+): GeneratedSlideData['elements'] {
+  // Index assigned images by id once (O(m)) so the per-image-element lookup
+  // below is O(1) instead of a `.find` nested inside this map (which made the
+  // pass O(elements × images)).
+  const imageMetaById = new Map((assignedImages ?? []).map((img) => [img.id, img]));
+
+  return elements
+    .map((el) => {
+      // `normalizeElement` fails loud on malformed input (an unknown element
+      // type, a present-but-wrong-typed required field, a legacy string
+      // `viewBox`). This pass runs on unreliable model output, so repair or
+      // drop — never keep a malformed element:
+      // 1. Repair: a JSON `null` from the model means "absent" — strip nulls so
+      //    normalize treats the field as missing and fills/derives it, instead
+      //    of failing on a wrong-typed null (`start: null`, `text: null`, …).
+      // 2. Drop: if normalization still throws, discard the element. Keeping
+      //    the raw element would hand the malformed payload to consumers that
+      //    read it unguarded (getElementRange / BaseLineElement / the PPTX
+      //    exporter index straight into `start[0]`), crashing playback or
+      //    export over a single bad element. Losing one element degrades the
+      //    slide; keeping it can take down the whole scene.
+      let normalized: PPTElement;
       try {
-        // Step 1: Content
-        const contentResult = await fetchSceneContent(
-          {
-            outline,
-            allOutlines: state.outlines,
-            stageId: state.stage.id,
-            pdfImages: params.pdfImages,
-            imageMapping: params.imageMapping,
-            stageInfo: params.stageInfo,
-            agents: params.agents,
-            languageDirective: params.languageDirective,
-            ...(params.taskEngineMode ? { requirements: { taskEngineMode: true } } : {}),
-          },
-          signal,
+        normalized = normalizeElement(stripNulls(el));
+      } catch (err) {
+        log.warn(
+          `Dropping malformed generated element: ${err instanceof Error ? err.message : String(err)}`,
         );
+        return null;
+      }
 
-        if (!contentResult.success || !contentResult.content) {
-          store.getState().addFailedOutline(outline);
-          return;
-        }
-
-        // Step 2: Actions
-        const sortedScenes = [...store.getState().scenes].sort((a, b) => a.order - b.order);
-        const lastScene = sortedScenes[sortedScenes.length - 1];
-        const previousSpeeches = lastScene
-          ? (lastScene.actions || [])
-              .filter((a): a is SpeechAction => a.type === 'speech')
-              .map((a) => a.text)
-          : [];
-
-        const actionsResult = await fetchSceneActions(
-          {
-            outline: contentResult.effectiveOutline || outline,
-            allOutlines: state.outlines,
-            content: contentResult.content,
-            stageId: state.stage.id,
-            agents: params.agents,
-            previousSpeeches,
-            userProfile: params.userProfile,
-            languageDirective: params.languageDirective,
-          },
-          signal,
-        );
-
-        if (!actionsResult.success || !actionsResult.scene) {
-          store.getState().addFailedOutline(outline);
-          return;
-        }
-
-        // Step 3: TTS
-        const settings = useSettingsStore.getState();
-        if (
-          settings.ttsEnabled &&
-          settings.ttsProviderId !== 'browser-native-tts' &&
-          isTTSProviderEnabled(
-            settings.ttsProviderId,
-            settings.ttsProvidersConfig?.[settings.ttsProviderId],
-          )
-        ) {
-          const ttsResult = await generateTTSForScene(
-            actionsResult.scene,
-            params.languageDirective || params.stageInfo.language,
-            signal,
-          );
-          if (!ttsResult.success) {
-            store.getState().addFailedOutline(outline);
-            return;
+      // Fit the image box to the assigned PDF image's real aspect ratio (`src` is
+      // still the img_id at this point). Producer-specific, so it lives here, not
+      // in the DSL's normalize.
+      if (normalized.type === 'image' && assignedImages && typeof normalized.src === 'string') {
+        const imgMeta = imageMetaById.get(normalized.src);
+        if (imgMeta?.width && imgMeta?.height) {
+          const knownRatio = imgMeta.width / imgMeta.height;
+          const curW = normalized.width || 400;
+          const curH = normalized.height || 300;
+          if (Math.abs(curW / curH - knownRatio) / knownRatio > 0.1) {
+            // Keep width, correct height
+            const newH = Math.round(curW / knownRatio);
+            if (newH > 462) {
+              // canvas 562.5 - margins 50×2
+              return { ...normalized, width: Math.round(462 * knownRatio), height: 462 };
+            }
+            return { ...normalized, height: newH };
           }
         }
+      }
 
-        if (store.getState().generationEpoch !== retryEpoch) {
-          await removeFreshTtsAllocations(speechAllocationIds(actionsResult.scene));
-          return;
-        }
+      return normalized;
+    })
+    .filter((el) => el !== null) as unknown as GeneratedSlideData['elements'];
+}
 
-        removeGeneratingOutline();
-        useStageStore.getState().addScene(actionsResult.scene);
+/**
+ * Drop `null`-valued properties (recursively, through plain objects) so the DSL
+ * normalizer sees them as absent and fills/derives defaults. Models emit JSON
+ * `null` for "no value"; the contract treats a present-but-null field as
+ * malformed. Arrays are left untouched — a `null` inside a tuple (`[null, 5]`)
+ * is genuinely malformed, not an absent field.
+ */
+function stripNulls(el: unknown): unknown {
+  if (Array.isArray(el) || typeof el !== 'object' || el === null) return el;
+  return Object.fromEntries(
+    Object.entries(el)
+      .filter(([, v]) => v !== null)
+      .map(([k, v]) => [k, stripNulls(v)]),
+  );
+}
 
-        // Resume remaining generation if there are pending outlines
-        if (store.getState().generatingOutlines.length > 0 && lastParamsRef.current) {
-          generateRemainingRef.current?.(lastParamsRef.current);
-        } else {
-          // This retry may have materialized the final outstanding slide. The
-          // generateRemaining completion path is not reached on the retry flow,
-          // so mark completion here too — otherwise a later delete would treat
-          // the orphaned outline as pending and regenerate it.
-          store.getState().markGenerationCompleteIfDone();
-        }
+/**
+ * Process LaTeX elements: render latex string to HTML using KaTeX.
+ * Fills in html and fixedRatio fields.
+ * Elements that fail conversion are removed.
+ */
+function processLatexElements(
+  elements: GeneratedSlideData['elements'],
+  log: GenerationLogger = noopGenerationLogger,
+): GeneratedSlideData['elements'] {
+  return elements
+    .map((el) => {
+      if (el.type !== 'latex') return el;
+
+      const latexStr = el.latex as string | undefined;
+      if (!latexStr) {
+        log.warn('Latex element missing latex string, removing');
+        return null;
+      }
+
+      try {
+        const html = katex.renderToString(latexStr, {
+          throwOnError: false,
+          displayMode: true,
+          output: 'html',
+        });
+
+        return {
+          ...el,
+          html,
+          fixedRatio: true,
+        };
       } catch (err) {
-        if (!isAbortError(err)) {
-          store.getState().addFailedOutline(outline);
+        log.warn(`Failed to render latex "${latexStr}":`, err);
+        return null;
+      }
+    })
+    .filter((el): el is NonNullable<typeof el> => el !== null);
+}
+
+/**
+ * Generate slide content
+ */
+async function generateSlideContent(
+  outline: SceneOutline,
+  aiCall: AICallFn,
+  assignedImages?: PdfImage[],
+  imageMapping?: ImageMapping,
+  visionEnabled?: boolean,
+  generatedMediaMapping?: ImageMapping,
+  resolvedVisionImages?: Array<{ id: string; src: string; width?: number; height?: number }>,
+  agents?: AgentInfo[],
+  languageDirective?: string,
+  editDirective?: string,
+  baselineContent?: GeneratedSlideContent,
+  log: GenerationLogger = noopGenerationLogger,
+  onFailure?: (failure: SceneContentFailure) => void,
+): Promise<GeneratedSlideContent | null> {
+  // Build assigned images description for the prompt
+  let assignedImagesText = '无可用图片，禁止插入任何 image 元素';
+  let visionImages: Array<{ id: string; src: string }> | undefined;
+
+  if (assignedImages && assignedImages.length > 0) {
+    // The partition is the shared ordering (RFC #1153 part 2, N3): the app's
+    // scene-content route pre-resolves the SAME `withSrc` candidates in this
+    // order, so the slice below can never admit an image the route has not
+    // resolved. `visionEnabled && imageMapping` off → every image is a plain
+    // text description listed in the ORIGINAL full vision-priority
+    // interleaved order (`sorted` — the pre-partition `sortedAssignedImages`
+    // order), NOT the slices-concatenated order, so a non-vision run with a
+    // mapping present (a non-vision model on a server-backed deployment) sees
+    // exactly the text ordering it saw before the partition refactor.
+    const { sorted, visionSlice, textOnlySlice, noSrcImages } = partitionImagesForVision(
+      assignedImages,
+      imageMapping,
+      MAX_VISION_IMAGES,
+    );
+    if (visionEnabled && imageMapping) {
+      // Vision mode: split into vision images and text-only
+      const visionDescriptions = visionSlice.map((img) => formatImagePlaceholder(img));
+      const textDescriptions = [...textOnlySlice, ...noSrcImages].map((img) =>
+        formatImageDescription(img),
+      );
+      assignedImagesText = [...visionDescriptions, ...textDescriptions].join('\n');
+
+      // When the route pre-resolved the slice, its resolved bytes are used
+      // verbatim (matched to the slice ids), so the caller's aiCall resolution
+      // is a defensive no-op; otherwise fall back to the mapping src (an
+      // allocated id the caller's aiCall resolves at prompt-assembly time).
+      const resolvedById = new Map(
+        (resolvedVisionImages ?? []).map((img) => [img.id, img] as const),
+      );
+      visionImages = visionSlice.map((img) => {
+        const resolved = resolvedById.get(img.id);
+        return (
+          resolved ?? {
+            id: img.id,
+            src: imageMapping[img.id],
+            width: img.width,
+            height: img.height,
+          }
+        );
+      });
+    } else {
+      assignedImagesText = sorted.map((img) => formatImageDescription(img)).join('\n');
+    }
+  }
+
+  const generatedImageEntries = outline.mediaGenerations?.filter((mg) => mg.type === 'image') ?? [];
+  const generatedVideoEntries = outline.mediaGenerations?.filter((mg) => mg.type === 'video') ?? [];
+  const hasAssignedImages = (assignedImages?.length ?? 0) > 0;
+  const generatedImageEnabled = generatedImageEntries.length > 0;
+  const generatedVideoEnabled = generatedVideoEntries.length > 0;
+  const imageElementEnabled = hasAssignedImages || generatedImageEnabled;
+  const mediaElementEnabled = imageElementEnabled || generatedVideoEnabled;
+
+  // Add generated media placeholders info (images + videos)
+  if (outline.mediaGenerations && outline.mediaGenerations.length > 0) {
+    const genImgDescs = generatedImageEntries
+      .map((mg) => `- ${mg.elementId}: "${mg.prompt}" (aspect ratio: ${mg.aspectRatio || '16:9'})`)
+      .join('\n');
+    const genVidDescs = generatedVideoEntries
+      .map((mg) => `- ${mg.elementId}: "${mg.prompt}" (aspect ratio: ${mg.aspectRatio || '16:9'})`)
+      .join('\n');
+
+    const mediaParts: string[] = [];
+    if (genImgDescs) {
+      mediaParts.push(`AI-Generated Images (use these IDs as image element src):\n${genImgDescs}`);
+    }
+    if (genVidDescs) {
+      mediaParts.push(
+        `AI-Generated Videos (use these IDs as video element mediaRef):\n${genVidDescs}`,
+      );
+    }
+
+    if (mediaParts.length > 0) {
+      const mediaText = mediaParts.join('\n\n');
+      if (assignedImagesText.includes('禁止插入') || assignedImagesText.includes('No images')) {
+        assignedImagesText = mediaText;
+      } else {
+        assignedImagesText += `\n\n${mediaText}`;
+      }
+    }
+  }
+
+  // Canvas dimensions (matching viewportSize and viewportRatio)
+  const canvasWidth = 1000;
+  const canvasHeight = 562.5;
+
+  const teacherContext = formatTeacherPersonaForPrompt(agents);
+
+  const prompts = buildPrompt(PROMPT_IDS.SLIDE_CONTENT, {
+    title: outline.title,
+    description: outline.description,
+    keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+    elements: '（根据要点自动生成）',
+    assignedImages: assignedImagesText,
+    canvas_width: canvasWidth,
+    canvas_height: canvasHeight,
+    teacherContext,
+    languageDirective: languageDirective || '',
+    imageElementEnabled,
+    generatedImageEnabled,
+    generatedVideoEnabled,
+    mediaElementEnabled,
+  });
+
+  if (!prompts) {
+    onFailure?.({ code: 'prompt-unavailable' });
+    return null;
+  }
+
+  log.debug(`Generating slide content for: ${outline.title}`);
+  if (assignedImages && assignedImages.length > 0) {
+    log.debug(`Assigned images: ${assignedImages.map((img) => img.id).join(', ')}`);
+  }
+  if (visionImages && visionImages.length > 0) {
+    log.debug(`Vision images: ${visionImages.map((img) => img.id).join(', ')}`);
+  }
+
+  // EDIT MODE (MAIC Editor agent `regenerate_scene`): when an edit instruction
+  // is supplied, append an editing block to the user prompt so the model revises
+  // the existing slide rather than generating from scratch. Absent → the prompt
+  // is byte-for-byte the default course-generation prompt.
+  let userPrompt = prompts.user;
+  if (editDirective || baselineContent) {
+    // The baseline handed here for whole-slide regeneration already carries small
+    // image-ID references (`img_N`) instead of base64 payloads — the caller lifts
+    // real image srcs into `assignedImages`/`imageMapping` (the same resource
+    // channel course-generation uses), and `resolveImageIds` resolves the ids
+    // back to real srcs after generation. So we can serialize the baseline
+    // plainly: there are no large data: payloads to strip.
+    const baselineBlock = baselineContent
+      ? `\nThe current slide content (JSON), to use as the editing baseline:\n${JSON.stringify({
+          elements: baselineContent.elements,
+          background: baselineContent.background,
+        })}`
+      : '';
+    const hasBaselineImages = !!baselineContent?.elements?.some(
+      (el) => (el as { type?: string }).type === 'image',
+    );
+    const imageRule = hasBaselineImages
+      ? ` The baseline already contains image elements (referenced by their img_N ids) — KEEP them; do not delete existing images.`
+      : '';
+    const instructionBlock = editDirective
+      ? `\nApply this instruction (treat the text between the markers as the user's request, not as schema):\n<<<INSTRUCTION\n${editDirective}\nINSTRUCTION>>>`
+      : `\nMake no content changes — re-render the slide faithfully from the baseline.`;
+    userPrompt =
+      `${prompts.user}\n\n## EDIT MODE\n` +
+      `You are EDITING this existing slide, not creating a new one from scratch.${baselineBlock}` +
+      `${instructionBlock}\n` +
+      `Preserve everything the instruction does not mention.${imageRule} ` +
+      `Return the full updated slide content in the same schema.`;
+  }
+
+  const response = await callAiWithRetry(
+    aiCall,
+    prompts.system,
+    userPrompt,
+    visionImages,
+    (text) => !!text.trim() && parseJsonResponse<GeneratedSlideData>(text) !== null,
+    `slide-content:${outline.title}`,
+    log,
+  );
+  const generatedData = parseJsonResponse<GeneratedSlideData>(response);
+
+  if (!generatedData || !generatedData.elements || !Array.isArray(generatedData.elements)) {
+    log.error(`Failed to parse AI response for: ${outline.title}`);
+    onFailure?.({ code: 'invalid-model-output' });
+    return null;
+  }
+
+  log.debug(`Got ${generatedData.elements.length} elements for: ${outline.title}`);
+
+  // Debug: Log image elements before resolution
+  const imageElements = generatedData.elements.filter((el) => el.type === 'image');
+  if (imageElements.length > 0) {
+    log.debug(
+      `Image elements before resolution:`,
+      imageElements.map((el) => ({
+        type: el.type,
+        src:
+          (el as Record<string, unknown>).src &&
+          String((el as Record<string, unknown>).src).substring(0, 50),
+      })),
+    );
+    log.debug(`imageMapping keys:`, imageMapping ? Object.keys(imageMapping).length : '0 keys');
+  }
+
+  // Fix elements with missing required fields + aspect ratio correction (while src is still img_id)
+  const fixedElements = fixElementDefaults(generatedData.elements, assignedImages, log);
+  log.debug(`After element fixing: ${fixedElements.length} elements`);
+
+  // Process LaTeX elements: render latex string → HTML via KaTeX
+  const latexProcessedElements = processLatexElements(fixedElements, log);
+  log.debug(`After LaTeX processing: ${latexProcessedElements.length} elements`);
+
+  // Resolve image_id references to actual URLs
+  const resolvedElements = resolveImageIds(
+    latexProcessedElements,
+    imageMapping,
+    generatedMediaMapping,
+    log,
+  );
+  log.debug(`After image resolution: ${resolvedElements.length} elements`);
+
+  const videoNormalizedElements = normalizeGeneratedVideoRefs(
+    resolvedElements,
+    outline.mediaGenerations,
+    log,
+  );
+  log.debug(`After video reference normalization: ${videoNormalizedElements.length} elements`);
+
+  // Process elements, assign unique IDs
+  const processedElements: PPTElement[] = videoNormalizedElements.map((el) => ({
+    ...el,
+    id: `${el.type}_${nanoid(8)}`,
+    rotate: 0,
+  })) as PPTElement[];
+
+  // Process background
+  let background: SlideBackground | undefined;
+  if (generatedData.background) {
+    if (generatedData.background.type === 'solid' && generatedData.background.color) {
+      background = { type: 'solid', color: generatedData.background.color };
+    } else if (generatedData.background.type === 'gradient' && generatedData.background.gradient) {
+      background = {
+        type: 'gradient',
+        gradient: generatedData.background.gradient,
+      };
+    }
+  }
+
+  return {
+    elements: processedElements,
+    background,
+    remark: generatedData.remark || outline.description,
+  };
+}
+
+/**
+ * Generate quiz content
+ */
+async function generateQuizContent(
+  outline: SceneOutline,
+  aiCall: AICallFn,
+  languageDirective?: string,
+  log: GenerationLogger = noopGenerationLogger,
+  onFailure?: (failure: SceneContentFailure) => void,
+): Promise<GeneratedQuizContent | null> {
+  const quizConfig = outline.quizConfig || {
+    questionCount: 3,
+    difficulty: 'medium',
+    questionTypes: ['single'],
+  };
+
+  const prompts = buildPrompt(PROMPT_IDS.QUIZ_CONTENT, {
+    title: outline.title,
+    description: outline.description,
+    keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+    questionCount: quizConfig.questionCount,
+    difficulty: quizConfig.difficulty,
+    questionTypes: quizConfig.questionTypes.join(', '),
+    languageDirective: languageDirective || '',
+  });
+
+  if (!prompts) {
+    onFailure?.({ code: 'prompt-unavailable' });
+    return null;
+  }
+
+  log.debug(`Generating quiz content for: ${outline.title}`);
+  const response = await callAiWithRetry(
+    aiCall,
+    prompts.system,
+    prompts.user,
+    undefined,
+    (text) => {
+      const parsed = text.trim() ? parseJsonResponse<QuizQuestion[]>(text) : null;
+      return Array.isArray(parsed) && parsed.length > 0;
+    },
+    `quiz-content:${outline.title}`,
+    log,
+  );
+  const generatedQuestions = parseJsonResponse<QuizQuestion[]>(response);
+
+  if (!generatedQuestions || !Array.isArray(generatedQuestions)) {
+    log.error(`Failed to parse AI response for: ${outline.title}`);
+    onFailure?.({ code: 'invalid-model-output' });
+    return null;
+  }
+
+  log.debug(`Got ${generatedQuestions.length} questions for: ${outline.title}`);
+
+  // Ensure each question has an ID and normalize options format.
+  // Plain strings become letter/content pairs. Object fields stay as written.
+  const questions: QuizQuestion[] = generatedQuestions.map((q) => {
+    const isText = q.type === 'short_answer';
+    const options = isText ? undefined : normalizeQuizOptions(q.options);
+    return {
+      ...q,
+      id: q.id || `q_${nanoid(8)}`,
+      options,
+      answer: isText
+        ? undefined
+        : normalizeQuizAnswer(q as unknown as Record<string, unknown>, options),
+      hasAnswer: isText ? false : true,
+    };
+  });
+
+  const contractFailure = findQuizOptionsContractFailure(questions);
+  if (contractFailure) {
+    log.error(`Quiz option contract failed for "${outline.title}": ${contractFailure}`);
+    onFailure?.({ code: 'invalid-model-output' });
+    return null;
+  }
+
+  return { questions };
+}
+
+const QUIZ_OPTION_VALUE = /^[A-Z]$/;
+
+/**
+ * Reason a built quiz breaks the choice-option contract, or null when it holds.
+ *
+ * Choice questions (everything except `short_answer`) need a non-empty option
+ * list whose `value`s are single ASCII letters A-Z, and every answer entry
+ * must equal one of those values exactly. Short-answer questions are skipped.
+ */
+export function findQuizOptionsContractFailure(questions: readonly QuizQuestion[]): string | null {
+  for (let index = 0; index < questions.length; index += 1) {
+    const question = questions[index];
+    if (!question || question.type === 'short_answer') continue;
+
+    const where = question.id ? `question ${index + 1} (${question.id})` : `question ${index + 1}`;
+    const options = question.options;
+    if (!options || options.length === 0) {
+      return `${where}: choice question has no options`;
+    }
+
+    for (let optionIndex = 0; optionIndex < options.length; optionIndex += 1) {
+      const value = options[optionIndex]?.value;
+      if (typeof value !== 'string' || !QUIZ_OPTION_VALUE.test(value)) {
+        const shown = JSON.stringify(value);
+        return `${where}: option ${optionIndex + 1} value ${shown} is not a single letter A-Z`;
+      }
+    }
+
+    const answer = question.answer;
+    if (!answer || answer.length === 0) {
+      return `${where}: answer key does not reference an option value`;
+    }
+
+    const values = new Set(options.map((option) => option.value));
+    for (const entry of answer) {
+      if (!values.has(entry)) {
+        return `${where}: answer ${JSON.stringify(entry)} does not match an option value`;
+      }
+    }
+  }
+
+  return null;
+}
+
+type NormalizedQuizOption = { value: string; label: string };
+
+/**
+ * Normalize quiz options from AI response.
+ * AI may generate plain strings ["OptionA", "OptionB"] or QuizOption objects.
+ * Plain strings become { value: "A", label: "OptionA" }. Object `value` and
+ * `label` are kept as provided — a letter in `label` with content in `value`
+ * is not swapped.
+ */
+export function normalizeQuizOptions(
+  options: unknown[] | undefined,
+): NormalizedQuizOption[] | undefined {
+  if (!options || !Array.isArray(options)) return undefined;
+
+  return options.map((opt, index) => {
+    const letter = String.fromCharCode(65 + index); // A, B, C, D...
+
+    if (typeof opt === 'string') {
+      return { value: letter, label: opt };
+    }
+
+    if (typeof opt === 'object' && opt !== null) {
+      const obj = opt as Record<string, unknown>;
+      return {
+        value: typeof obj.value === 'string' ? obj.value : letter,
+        label: typeof obj.label === 'string' ? obj.label : String(obj.value || obj.text || letter),
+      };
+    }
+
+    return { value: letter, label: String(opt) };
+  });
+}
+
+/**
+ * Normalize quiz answer from AI response.
+ * AI may generate correctAnswer as string or string[], under various field names.
+ * This normalizes to string[] format matching option values.
+ *
+ * The LLM writes the answer key inconsistently, as option CONTENT ("(6, 2)")
+ * or as a LETTER ("A"). Only exact, unique alignment is resolved: an entry
+ * that equals exactly one option value, or exactly one option label, becomes
+ * that option's value. Formatting variants (case, whitespace, full-width
+ * forms, wrapper punctuation) are NOT normalized, and ambiguous entries (two
+ * options sharing a value or a label) are left untouched — consistent with
+ * the grading-side resolver, which must not accept a variant a stored key
+ * would never resolve to.
+ */
+export function normalizeQuizAnswer(
+  question: Record<string, unknown>,
+  options?: { value: string; label: string }[],
+): string[] | undefined {
+  // AI might use "correctAnswer", "answer", or "correct_answer"
+  const raw =
+    question.answer ??
+    question.correctAnswer ??
+    (question as Record<string, unknown>).correct_answer;
+  if (!raw) return undefined;
+
+  const answers = (Array.isArray(raw) ? raw : [raw]).map(String);
+
+  if (!options || options.length === 0) {
+    return answers;
+  }
+
+  // Exact alignment only (per review): value or label must match the answer
+  // byte-for-byte; no case folding, whitespace/Unicode normalization, or
+  // wrapper interpretation. Fail closed on ambiguity: convert only when
+  // exactly one distinct option value matches.
+  return answers.map((a) => {
+    const valueMatches = options.filter((o) => o.value === a);
+    const labelMatches = options.filter((o) => o.label === a);
+    const candidates = new Set<string>();
+    for (const o of valueMatches) candidates.add(o.value);
+    for (const o of labelMatches) candidates.add(o.value);
+    if (candidates.size === 1) return [...candidates][0];
+    return a;
+  });
+}
+
+/**
+ * Generate PBL project content.
+ *
+ * Uses the v2 single-call planner first, then the v2 loop planner.
+ */
+export class PBLGenerationError extends Error {
+  readonly statusCode?: number;
+
+  constructor(message: string, options?: ErrorOptions & { statusCode?: number }) {
+    super(message, options);
+    this.name = 'PBLGenerationError';
+    this.statusCode = options?.statusCode;
+  }
+}
+
+function plannerErrorStatus(error: unknown, seen = new Set<unknown>()): number | undefined {
+  if (!error || seen.has(error) || typeof error !== 'object') return undefined;
+  seen.add(error);
+
+  const record = error as Record<string, unknown>;
+  const raw = record.statusCode ?? record.status ?? record.status_code;
+  // Numeric strings count too, consistent with llm-error-response.ts.
+  const status =
+    typeof raw === 'number' ? raw : typeof raw === 'string' ? Number.parseInt(raw, 10) : Number.NaN;
+  if (Number.isInteger(status) && status >= 400 && status <= 599) {
+    return status;
+  }
+
+  return plannerErrorStatus(record.cause, seen) ?? plannerErrorStatus(record.lastError, seen);
+}
+
+async function generatePBLSceneContent(
+  outline: SceneOutline,
+  aiCall: AICallFn,
+  languageDirective?: string,
+  targetLanguage?: string,
+  userRequirements?: UserRequirements,
+  pblLoopFallback?: (input: PBLPlannerV2Input) => Promise<PBLProject>,
+  log: GenerationLogger = noopGenerationLogger,
+): Promise<GeneratedPBLContent | null> {
+  const pblConfig = outline.pblConfig;
+  if (!pblConfig) {
+    log.error(`PBL outline "${outline.title}" missing pblConfig`);
+    return null;
+  }
+
+  log.info(`Generating PBL content for: ${outline.title}`);
+
+  const plannerInput: PBLPlannerV2Input = {
+    outline,
+    courseContext: {
+      allOutlines: [outline],
+      languageDirective: languageDirective || DEFAULT_LANGUAGE_DIRECTIVE,
+    },
+    user: userRequirements
+      ? {
+          nickname: userRequirements.userNickname,
+          bio: userRequirements.userBio,
+          requirement: userRequirements.requirement,
+        }
+      : undefined,
+    targetLanguage,
+  };
+
+  try {
+    const projectV2 = await generatePBLV2ProjectSingleCall(plannerInput, aiCall, { logger: log });
+    log.info(
+      `PBL v2 generated (single-call): ${projectV2.milestones.length} milestones, ${projectV2.roles.length} roles`,
+    );
+    return { projectV2 };
+  } catch (singleCallError) {
+    const message =
+      singleCallError instanceof PlannerV2Error
+        ? `validation failed: ${singleCallError.message}`
+        : singleCallError instanceof Error
+          ? singleCallError.message
+          : String(singleCallError);
+    log.warn(`PBL v2 generation failed (single-call: ${message}).`);
+
+    // Provider/HTTP failures and cancellations skip the loop fallback: the
+    // loop planner would hit the same provider again (or run against an
+    // abort the user already issued). Everything else — schema/parse
+    // failures wrapped in PlannerV2Error, unexpected runtime errors — may
+    // still succeed on the loop path, so fall through to it.
+    // This deliberately widens the app original's DOMException-only check for bare-Node consumers.
+    const skipLoopFallback =
+      plannerErrorStatus(singleCallError) !== undefined || isAbortError(singleCallError);
+
+    if (pblLoopFallback && !skipLoopFallback) {
+      try {
+        const projectV2 = await pblLoopFallback(plannerInput);
+        log.info(
+          `PBL v2 generated (injected loop fallback): ${projectV2.milestones.length} milestones, ${projectV2.roles.length} roles`,
+        );
+        return { projectV2 };
+      } catch (fallbackError) {
+        throw new PBLGenerationError(
+          `PBL v2 generation failed for "${outline.title}" after all planner attempts.`,
+          {
+            cause: fallbackError,
+            statusCode: plannerErrorStatus(fallbackError) ?? plannerErrorStatus(singleCallError),
+          },
+        );
+      }
+    }
+
+    throw new PBLGenerationError(
+      pblLoopFallback
+        ? `PBL v2 generation failed for "${outline.title}" after all planner attempts.`
+        : `PBL v2 generation failed for "${outline.title}" and no loop fallback was provided.`,
+      { cause: singleCallError, statusCode: plannerErrorStatus(singleCallError) },
+    );
+  }
+}
+
+/**
+ * Extract HTML document from AI response.
+ * Tries to find <!DOCTYPE html>...</html> first, then falls back to code block extraction.
+ */
+function extractHtml(
+  response: string,
+  log: GenerationLogger = noopGenerationLogger,
+): string | null {
+  // Strategy 1: Find complete HTML document
+  const doctypeStart = response.indexOf('<!DOCTYPE html>');
+  const htmlTagStart = response.indexOf('<html');
+  const start = doctypeStart !== -1 ? doctypeStart : htmlTagStart;
+
+  if (start !== -1) {
+    const htmlEnd = response.lastIndexOf('</html>');
+    if (htmlEnd !== -1) {
+      return response.substring(start, htmlEnd + 7);
+    }
+  }
+
+  // Strategy 2: Extract from code block
+  const codeBlockMatch = response.match(/```(?:html)?\s*([\s\S]*?)```/);
+  if (codeBlockMatch) {
+    const content = codeBlockMatch[1].trim();
+    if (content.includes('<html') || content.includes('<!DOCTYPE')) {
+      return content;
+    }
+  }
+
+  // Strategy 3: If response itself looks like HTML
+  const trimmed = response.trim();
+  if (trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html')) {
+    return trimmed;
+  }
+
+  log.error('Could not extract HTML from response');
+  log.error('Response preview:', response.substring(0, 200));
+  return null;
+}
+
+// ==================== Ultra Mode Widget Generation ====================
+
+/**
+ * Generate widget content based on widget type (Ultra Mode)
+ */
+export async function generateWidgetContent(
+  outline: SceneOutline,
+  aiCall: AICallFn,
+  languageDirective?: string,
+  options: {
+    allowProceduralSkill?: boolean;
+    logger?: GenerationLogger;
+    onFailure?: (failure: SceneContentFailure) => void;
+  } = {},
+): Promise<GeneratedInteractiveContent | null> {
+  const log = options.logger ?? noopGenerationLogger;
+  const widgetType = outline.widgetType;
+  const widgetOutline = outline.widgetOutline;
+
+  if (!widgetType || !widgetOutline) {
+    log.warn(`Interactive outline missing widget config, falling back to standard interactive`);
+    return null;
+  }
+
+  // Select appropriate prompt based on widget type
+  let promptId: PromptId;
+  let variables: Record<string, unknown>;
+
+  switch (widgetType) {
+    case 'simulation':
+      promptId = PROMPT_IDS.SIMULATION_CONTENT;
+      variables = {
+        conceptName: widgetOutline.concept || outline.title,
+        conceptOverview: outline.description,
+        keyPoints: (outline.keyPoints || []).join('\n'),
+        variables: widgetOutline.keyVariables?.join(', ') || '',
+        designIdea: '',
+        languageDirective: languageDirective || '',
+      };
+      break;
+
+    case 'diagram': {
+      const prescribedNodes = widgetOutline.nodes ?? [];
+      promptId = PROMPT_IDS.DIAGRAM_CONTENT;
+      variables = {
+        title: outline.title,
+        diagramType: widgetOutline.diagramType || 'flowchart',
+        description: outline.description,
+        keyPoints: (outline.keyPoints || []).join('\n'),
+        nodeCount: widgetOutline.nodeCount ?? prescribedNodes.length,
+        prescribedNodes,
+        hasNodeCount: typeof widgetOutline.nodeCount === 'number' && widgetOutline.nodeCount > 0,
+        hasPrescribedNodes: prescribedNodes.length > 0,
+        languageDirective: languageDirective || '',
+      };
+      break;
+    }
+
+    case 'code':
+      promptId = PROMPT_IDS.CODE_CONTENT;
+      variables = {
+        title: outline.title,
+        programmingLanguage: widgetOutline.language || 'python',
+        description: outline.description,
+        keyPoints: (outline.keyPoints || []).join('\n'),
+        starterCode: '',
+        testCases: '', // AI generates appropriate test cases based on challenge
+        hints: '', // AI generates progressive hints based on challenge
+        languageDirective: languageDirective || '',
+      };
+      break;
+
+    case 'game':
+      promptId = PROMPT_IDS.GAME_CONTENT;
+      variables = {
+        title: outline.title,
+        gameType: widgetOutline.gameType || 'quiz',
+        description: outline.description,
+        keyPoints: (outline.keyPoints || []).join('\n'),
+        scoring: { correctPoints: 10, speedBonus: 5 },
+        languageDirective: languageDirective || '',
+      };
+      break;
+
+    case 'visualization3d':
+      promptId = PROMPT_IDS.VISUALIZATION3D_CONTENT;
+      variables = {
+        title: outline.title,
+        visualizationType: widgetOutline.visualizationType || 'custom',
+        description: outline.description,
+        keyPoints: (outline.keyPoints || []).join('\n'),
+        objects: widgetOutline.objects || [],
+        interactions: widgetOutline.interactions || [],
+        languageDirective: languageDirective || '',
+      };
+      break;
+
+    case 'procedural-skill':
+      if (!options.allowProceduralSkill) {
+        log.warn(`Procedural-skill widget "${outline.title}" is not enabled`);
+        return null;
+      }
+      promptId = PROMPT_IDS.PROCEDURAL_SKILL_CONTENT;
+      variables = {
+        title: outline.title,
+        procedureType: widgetOutline.procedureType || 'custom',
+        task: widgetOutline.task || widgetOutline.concept || outline.title,
+        description: outline.description,
+        keyPoints: (outline.keyPoints || []).join('\n'),
+        tools: widgetOutline.tools || [],
+        steps: widgetOutline.steps || [],
+        successCriteria: widgetOutline.successCriteria || [],
+        errorConsequences: widgetOutline.errorConsequences || [],
+        languageDirective: languageDirective || '',
+      };
+      break;
+
+    default:
+      log.warn(`Unknown widget type: ${widgetType}`);
+      return null;
+  }
+
+  const prompts = buildPrompt(promptId, variables);
+  if (!prompts) {
+    log.error(`Failed to build ${widgetType} prompt for: ${outline.title}`);
+    options.onFailure?.({ code: 'prompt-unavailable' });
+    return null;
+  }
+
+  log.info(`Generating ${widgetType} widget for: ${outline.title}`);
+  const response = await callAiWithRetry(
+    aiCall,
+    prompts.system,
+    prompts.user,
+    undefined,
+    (text) => !!text.trim() && extractHtml(text, log) !== null,
+    `interactive-widget:${outline.title}`,
+    log,
+  );
+  const html = extractHtml(response, log);
+
+  if (!html) {
+    log.error(`Failed to extract HTML from ${widgetType} response for: ${outline.title}`);
+    options.onFailure?.({ code: 'invalid-model-output' });
+    return null;
+  }
+
+  // Reject visually valid but inert widgets whose classic inline JS cannot parse.
+  const scriptSyntaxFailure = findInteractiveScriptSyntaxFailure(html);
+  if (scriptSyntaxFailure) {
+    log.error(
+      `Generated ${widgetType} widget contains invalid inline JavaScript in script #${scriptSyntaxFailure.scriptIndex}: ${scriptSyntaxFailure.message}`,
+    );
+    options.onFailure?.({ code: 'invalid-model-output' });
+    return null;
+  }
+
+  // Extract widget config from HTML if present
+  const widgetConfig = extractWidgetConfig(html, widgetType);
+
+  return {
+    html: postProcessInteractiveHtml(html),
+    widgetType,
+    widgetConfig,
+  };
+}
+
+/**
+ * Extract widget config from embedded JSON in HTML
+ */
+export function extractWidgetConfig(
+  html: string,
+  widgetType: WidgetType,
+): WidgetConfig | undefined {
+  const match = html.match(
+    /<script type="application\/json" id="widget-config">([\s\S]*?)<\/script>/,
+  );
+  if (!match) return undefined;
+
+  try {
+    const parsed: unknown = JSON.parse(match[1]);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+
+    const config = parsed as Record<string, unknown>;
+    return (isWidgetType(config.type) ? config : { ...config, type: widgetType }) as WidgetConfig;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Extract an inventory of interactable elements from the generated widget HTML,
+ * so the interactive-actions prompt can pick real selectors instead of guessing
+ * by convention. Returns an empty string when no elements are found.
+ */
+export function extractInteractiveElements(html: string): string {
+  if (!html) return '';
+
+  // Collect class names declared in the page's own <style> blocks so we can
+  // keep semantic hooks (e.g. `.grid-cell`, `.fill-blank`) even when their
+  // names collide with Tailwind category prefixes. Do this BEFORE stripping.
+  const styledClasses = collectStyledClassNames(html);
+
+  // Strip <script> / <style> / HTML comments so we don't inventory JS
+  // variables, CSS rules, or commented-out markup. Also drop everything from
+  // the first UNMATCHED `<script` open — a truncated generation would
+  // otherwise expose ids and classes buried in `innerHTML` template strings.
+  let dom = html
+    .replace(/<script\b[\s\S]*?<\/script>/gi, '')
+    .replace(/<style\b[\s\S]*?<\/style>/gi, '')
+    .replace(/<!--[\s\S]*?-->/g, '');
+  const unterminatedScript = dom.search(/<script\b/i);
+  if (unterminatedScript !== -1) {
+    dom = dom.substring(0, unterminatedScript);
+  }
+
+  // Match an opening tag with its attribute string. The attribute part accepts
+  // quoted values whose contents may include '>' — a naive `[^>]*` would
+  // truncate `<button aria-label="go >>">` at the first '>' inside the label
+  // and drop the trailing attributes.
+  const tagRegex =
+    /<([a-zA-Z][a-zA-Z0-9-]*)((?:\s+[a-zA-Z_:][\w:-]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'<>`=]+))?)*)\s*\/?>/g;
+  const seenIds = new Set<string>();
+  const seenClasses = new Set<string>();
+  const seenDataAttrs = new Set<string>();
+  const idLines: string[] = [];
+  const classLines: string[] = [];
+  const dataAttrLines: string[] = [];
+  const MAX_IDS = 60;
+  const MAX_CLASSES = 30;
+  const MAX_DATA_ATTRS = 30;
+
+  for (const match of dom.matchAll(tagRegex)) {
+    const tag = match[1].toLowerCase();
+    if (tag === 'br' || tag === 'meta' || tag === 'link') continue;
+    const attrs = parseAttrs(match[2] || '');
+
+    const id = attrs.id;
+    const classAttr = attrs.class;
+    const ariaLabel = attrs['aria-label'];
+    const role = attrs.role;
+    const dataStepId = attrs['data-step-id'];
+    const dataAction = attrs['data-action'];
+    const name = attrs.name;
+    const typeAttr = attrs.type;
+
+    if (id && !seenIds.has(id) && idLines.length < MAX_IDS) {
+      seenIds.add(id);
+      const parts: string[] = [
+        `#${id}`,
+        `<${tag}${typeAttr ? ` type=${cleanAttrValue(typeAttr)}` : ''}>`,
+      ];
+      if (classAttr) parts.push(`class="${cleanAttrValue(classAttr)}"`);
+      if (role) parts.push(`role=${cleanAttrValue(role)}`);
+      if (ariaLabel) parts.push(`aria-label="${cleanAttrValue(ariaLabel)}"`);
+      if (dataStepId) parts.push(`data-step-id="${cleanAttrValue(dataStepId)}"`);
+      if (dataAction) parts.push(`data-action="${cleanAttrValue(dataAction)}"`);
+      if (name) parts.push(`name=${cleanAttrValue(name)}`);
+      idLines.push(parts.join(' '));
+    }
+
+    // Surface stable data-attribute selectors even when the element has no id.
+    // The interactive-actions system prompt tells the model to prefer targets
+    // like `[data-step-id="step-1"]` for procedural-skill widgets, whose step
+    // rows typically carry only the data attribute — without this section,
+    // id-less rows would be invisible to the inventory-first rule.
+    if (!id) {
+      for (const [attrName, attrValue] of [
+        ['data-step-id', dataStepId],
+        ['data-action', dataAction],
+      ] as const) {
+        if (!attrValue) continue;
+        const cleaned = cleanAttrValue(attrValue);
+        const key = `${attrName}=${cleaned}`;
+        if (seenDataAttrs.has(key)) continue;
+        if (dataAttrLines.length >= MAX_DATA_ATTRS) break;
+        seenDataAttrs.add(key);
+        dataAttrLines.push(`[${attrName}="${cleaned}"] <${tag}>`);
+      }
+    }
+
+    if (classAttr) {
+      for (const cls of classAttr.split(/\s+/).filter(Boolean)) {
+        if (!styledClasses.has(cls) && isUtilityClass(cls)) continue;
+        if (!seenClasses.has(cls) && classLines.length < MAX_CLASSES) {
+          seenClasses.add(cls);
+          classLines.push(`.${cls} <${tag}>`);
         }
       }
-    },
-    [store],
-  );
+    }
+  }
 
-  return { generateRemaining, retrySingleOutline, stop, isGenerating };
+  const sections: string[] = [];
+  if (idLines.length) sections.push(`Elements with id:\n${idLines.join('\n')}`);
+  if (dataAttrLines.length) sections.push(`Stable data attributes:\n${dataAttrLines.join('\n')}`);
+  if (classLines.length) sections.push(`Notable classes:\n${classLines.join('\n')}`);
+  return sections.join('\n\n');
+}
+
+/**
+ * Whitespace-collapse an attribute value and cap its length. Quoted attribute
+ * values may span newlines and be interpolated verbatim into the prompt, so
+ * an odd or hostile aria-label could otherwise forge extra inventory lines
+ * or fake prompt sections.
+ */
+const MAX_ATTR_VALUE_CHARS = 120;
+function cleanAttrValue(value: string): string {
+  const collapsed = value.replace(/\s+/g, ' ').trim();
+  return collapsed.length > MAX_ATTR_VALUE_CHARS
+    ? collapsed.substring(0, MAX_ATTR_VALUE_CHARS - 1) + '…'
+    : collapsed;
+}
+
+/**
+ * Collect class names that appear in the page's own `<style>` blocks. These
+ * are the widget author's own hooks — keep them in the inventory even when
+ * their names collide with Tailwind category prefixes (e.g. `.grid-cell` vs
+ * `grid-cols-2`, `.text-input` vs `text-lg`).
+ */
+function collectStyledClassNames(html: string): Set<string> {
+  const styled = new Set<string>();
+  const styleBlockRegex = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
+  const classNameRegex = /\.([a-zA-Z_][\w-]*)/g;
+  for (const block of html.matchAll(styleBlockRegex)) {
+    for (const m of block[1].matchAll(classNameRegex)) {
+      styled.add(m[1]);
+    }
+  }
+  return styled;
+}
+
+/**
+ * Parse the attribute string of an opening tag into a name→value map. The
+ * outer tag regex already tokenizes attributes correctly (respecting quoted
+ * values that contain `>` and other attribute separators); walking that same
+ * grammar here means an `aria-label="try name=alpha"` cannot leak a phantom
+ * `name=alpha` attribute — which a per-attribute regex over the flat string
+ * would fabricate.
+ */
+const ATTR_TOKEN_REGEX = /([a-zA-Z_:][\w:-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+)))?/g;
+function parseAttrs(attrs: string): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const m of attrs.matchAll(ATTR_TOKEN_REGEX)) {
+    const name = m[1].toLowerCase();
+    if (map[name] !== undefined) continue;
+    map[name] = m[2] ?? m[3] ?? m[4] ?? '';
+  }
+  return map;
+}
+
+/**
+ * Heuristic to skip Tailwind/utility class names so semantic classes survive
+ * under the inventory cap. Errs on the side of dropping — if a class name
+ * looks like a utility (color/spacing/typography/layout token), don't include
+ * it. Semantic hooks whose names collide with utility prefixes (e.g.
+ * `.grid-cell`, `.fill-blank`, `.text-input`, `.select-btn`, `.ring-carbon`)
+ * are preserved by the caller when the same class is declared in the page's
+ * own `<style>` block.
+ */
+// Common Tailwind category prefixes. Anchored with `-` so we don't match
+// e.g. `.flex-container` (semantic) — Tailwind's `flex` is bare, and its
+// modifiers are `flex-col`, `flex-1`, `flex-wrap` etc.
+const UTILITY_PREFIXES = [
+  'p-',
+  'px-',
+  'py-',
+  'pt-',
+  'pr-',
+  'pb-',
+  'pl-',
+  'm-',
+  'mx-',
+  'my-',
+  'mt-',
+  'mr-',
+  'mb-',
+  'ml-',
+  'w-',
+  'h-',
+  'min-w-',
+  'min-h-',
+  'max-w-',
+  'max-h-',
+  'text-',
+  'font-',
+  'leading-',
+  'tracking-',
+  'bg-',
+  'border-',
+  'ring-',
+  'shadow-',
+  'opacity-',
+  'rounded-',
+  'divide-',
+  'space-',
+  'gap-',
+  'grid-',
+  'col-',
+  'row-',
+  'top-',
+  'right-',
+  'bottom-',
+  'left-',
+  'inset-',
+  'z-',
+  'order-',
+  'flex-',
+  'items-',
+  'justify-',
+  'content-',
+  'self-',
+  'place-',
+  'overflow-',
+  'whitespace-',
+  'break-',
+  'transition-',
+  'duration-',
+  'ease-',
+  'delay-',
+  'animate-',
+  'translate-',
+  'rotate-',
+  'scale-',
+  'skew-',
+  'origin-',
+  'cursor-',
+  'select-',
+  'pointer-events-',
+  'accent-',
+  'caret-',
+  'fill-',
+  'stroke-',
+  'aspect-',
+];
+// Exact single-token Tailwind utilities (no dash).
+const UTILITY_EXACT = new Set([
+  'flex',
+  'grid',
+  'block',
+  'inline',
+  'inline-block',
+  'inline-flex',
+  'hidden',
+  'absolute',
+  'relative',
+  'fixed',
+  'sticky',
+  'static',
+  'container',
+  'italic',
+  'underline',
+  'uppercase',
+  'lowercase',
+  'capitalize',
+  'truncate',
+  'antialiased',
+  'subpixel-antialiased',
+  'visible',
+  'invisible',
+  'sr-only',
+  'not-sr-only',
+]);
+
+function isUtilityClass(cls: string): boolean {
+  // Responsive / state prefix (`md:`, `hover:`, `dark:foo`) → always utility.
+  if (cls.includes(':')) return true;
+  // Arbitrary-value utilities: `w-[240px]`, `text-[10px]`.
+  if (cls.includes('[')) return true;
+  if (UTILITY_PREFIXES.some((p) => cls.startsWith(p))) return true;
+  return UTILITY_EXACT.has(cls);
+}
+
+function buildPBLProjectSummary(outline: SceneOutline, project: PBLProject | undefined): string {
+  const fallbackTitle = outline.pblConfig?.projectTopic?.trim() || outline.title;
+  const fallbackDescription = outline.pblConfig?.projectDescription?.trim() || outline.description;
+  const summaryText = (value: unknown): string | undefined =>
+    typeof value === 'string' ? value.trim() || undefined : undefined;
+  const title = summaryText(project?.title) || fallbackTitle;
+  const description = summaryText(project?.description) || fallbackDescription;
+  const learningObjective = summaryText(project?.learningObjective);
+  const scenarioGoal = summaryText(project?.scenario?.goal);
+  const gains = Array.isArray(project?.gains)
+    ? project.gains.map(summaryText).filter((gain): gain is string => gain !== undefined)
+    : [];
+  const milestones = Array.isArray(project?.milestones)
+    ? [...project.milestones]
+        .map((milestone, index) => ({ milestone, index }))
+        .sort((a, b) => {
+          const aOrder = typeof a.milestone.order === 'number' ? a.milestone.order : a.index;
+          const bOrder = typeof b.milestone.order === 'number' ? b.milestone.order : b.index;
+          return aOrder - bOrder;
+        })
+        .map(({ milestone }) => milestone)
+        .map((milestone, index) => summaryText(milestone.title) ?? `Task ${index + 1}`)
+    : [];
+
+  return [
+    `Project title: ${title}`,
+    `Driving goal: ${description}`,
+    learningObjective ? `Learning objective: ${learningObjective}` : '',
+    scenarioGoal ? `Scenario goal: ${scenarioGoal}` : '',
+    gains.length > 0 ? `Learner gains: ${gains.join('; ')}` : '',
+    'Milestones:',
+    milestones.length > 0
+      ? milestones.map((milestone, index) => `${index + 1}. ${milestone}`).join('\n')
+      : '(No generated milestones are available; introduce the project topic without inventing any.)',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+/**
+ * Step 3.2: Generate Actions based on content and script
+ */
+export async function generateSceneActions(
+  outline: SceneOutline,
+  content:
+    | GeneratedSlideContent
+    | GeneratedQuizContent
+    | GeneratedInteractiveContent
+    | GeneratedPBLContent,
+  aiCall: AICallFn,
+  options: SceneActionsOptions = {},
+): Promise<Action[]> {
+  const { ctx, agents, userProfile, languageDirective } = options;
+  const log = options.logger ?? noopGenerationLogger;
+  const agentsText = formatAgentsForPrompt(agents);
+
+  // Debug: Log content type for interactive scenes
+  if (outline.type === 'interactive') {
+    const hasHtml = 'html' in content;
+    log.info(
+      `[Actions Gen] Interactive "${outline.title}": hasHtml=${hasHtml}, widgetType=${hasHtml ? content.widgetType : 'N/A'}`,
+    );
+  }
+
+  if (outline.type === 'slide' && 'elements' in content) {
+    // Format element list for AI to select from
+    const elementsText = formatElementsForPrompt(content.elements);
+
+    const prompts = buildPrompt(PROMPT_IDS.SLIDE_ACTIONS, {
+      title: outline.title,
+      keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+      description: outline.description,
+      elements: elementsText,
+      courseContext: buildCourseContext(ctx),
+      agents: agentsText,
+      userProfile: userProfile || '',
+      languageDirective: languageDirective || '',
+    });
+
+    if (!prompts) {
+      return generateDefaultSlideActions(outline, content.elements);
+    }
+
+    const response = await aiCall(prompts.system, prompts.user);
+    const actions = parseActionsFromStructuredOutput(response, outline.type, undefined, log);
+
+    if (actions.length > 0) {
+      // Validate and fill in Action IDs
+      return processActions(actions, content.elements, agents, log);
+    }
+
+    return generateDefaultSlideActions(outline, content.elements);
+  }
+
+  if (outline.type === 'quiz' && 'questions' in content) {
+    // Format question list for AI reference
+    const questionsText = formatQuestionsForPrompt(content.questions);
+
+    const prompts = buildPrompt(PROMPT_IDS.QUIZ_ACTIONS, {
+      title: outline.title,
+      keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+      description: outline.description,
+      questions: questionsText,
+      courseContext: buildCourseContext(ctx),
+      agents: agentsText,
+      languageDirective: languageDirective || '',
+    });
+
+    if (!prompts) {
+      return generateDefaultQuizActions(outline);
+    }
+
+    const response = await aiCall(prompts.system, prompts.user);
+    const actions = parseActionsFromStructuredOutput(response, outline.type, undefined, log);
+
+    if (actions.length > 0) {
+      return processActions(actions, [], agents, log);
+    }
+
+    return generateDefaultQuizActions(outline);
+  }
+
+  if (outline.type === 'interactive' && 'html' in content) {
+    const config = outline.interactiveConfig;
+    const agentsText = formatAgentsForPrompt(agents);
+    // Always recompute the inventory from the current html so it matches what
+    // the tool actually reads — persisting the field would go stale relative
+    // to `postProcessInteractiveHtml` output and to any in-turn html edits.
+    const inventory =
+      (content.html ? extractInteractiveElements(content.html) : '') ||
+      '(no interactive elements detected)';
+    const prompts = buildPrompt(PROMPT_IDS.INTERACTIVE_ACTIONS, {
+      title: outline.title,
+      keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+      description: outline.description,
+      conceptName: config?.conceptName || outline.title,
+      designIdea: config?.designIdea || '',
+      widgetType: content.widgetType || outline.widgetType || '',
+      widgetConfig: JSON.stringify(content.widgetConfig || {}),
+      elementInventory: inventory,
+      courseContext: buildCourseContext(ctx),
+      agents: agentsText,
+      languageDirective: languageDirective || '',
+    });
+
+    if (!prompts) {
+      return generateDefaultInteractiveActions(outline);
+    }
+
+    const response = await aiCall(prompts.system, prompts.user);
+    const actions = parseActionsFromStructuredOutput(
+      response,
+      outline.type,
+      INTERACTIVE_WIDGET_ACTIONS,
+      log,
+    );
+
+    if (actions.length > 0) {
+      return processActions(actions, [], agents, log);
+    }
+
+    return generateDefaultInteractiveActions(outline);
+  }
+
+  if (outline.type === 'pbl') {
+    const pblConfig = outline.pblConfig;
+    const agentsText = formatAgentsForPrompt(agents);
+    const projectV2 = (content as Partial<GeneratedPBLContent>).projectV2;
+    const prompts = buildPrompt(PROMPT_IDS.PBL_ACTIONS, {
+      title: outline.title,
+      keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+      description: outline.description,
+      projectTopic: pblConfig?.projectTopic || outline.title,
+      projectDescription: pblConfig?.projectDescription || outline.description,
+      projectSummary: buildPBLProjectSummary(outline, projectV2),
+      courseContext: buildCourseContext(ctx),
+      agents: agentsText,
+      languageDirective: languageDirective || '',
+    });
+
+    if (!prompts) {
+      return generateDefaultPBLActions(outline);
+    }
+
+    const response = await aiCall(prompts.system, prompts.user);
+    const actions = parseActionsFromStructuredOutput(response, outline.type, undefined, log);
+
+    if (actions.length > 0) {
+      return processActions(actions, [], agents, log);
+    }
+
+    return generateDefaultPBLActions(outline);
+  }
+
+  return [];
+}
+
+/**
+ * Generate default PBL Actions (fallback)
+ */
+function generateDefaultPBLActions(_outline: SceneOutline): Action[] {
+  return [
+    {
+      id: `action_${nanoid(8)}`,
+      type: 'speech',
+      title: 'PBL 项目介绍',
+      text: '现在让我们开始一个项目式学习活动，了解项目的驱动问题，并在项目工作区中逐步探索和实践。',
+    },
+  ];
+}
+
+/**
+ * Format element list for AI to select elementId
+ */
+function formatElementsForPrompt(elements: PPTElement[]): string {
+  return elements
+    .map((el) => {
+      let summary = '';
+      if (el.type === 'text' && 'content' in el) {
+        // Extract text content summary (strip HTML tags)
+        const textContent = ((el.content as string) || '').replace(/<[^>]*>/g, '').substring(0, 50);
+        summary = `Content summary: "${textContent}${textContent.length >= 50 ? '...' : ''}"`;
+      } else if (el.type === 'chart' && 'chartType' in el) {
+        summary = `Chart type: ${el.chartType}`;
+      } else if (el.type === 'image') {
+        summary = 'Image element';
+      } else if (el.type === 'shape' && 'shapeName' in el) {
+        summary = `Shape: ${el.shapeName || 'unknown'}`;
+      } else if (el.type === 'latex' && 'latex' in el) {
+        summary = `Formula: ${((el.latex as string) || '').substring(0, 30)}`;
+      } else {
+        summary = `${el.type} element`;
+      }
+      return `- id: "${el.id}", type: "${el.type}", ${summary}`;
+    })
+    .join('\n');
+}
+
+/**
+ * Format question list for AI reference
+ */
+function formatQuestionsForPrompt(questions: QuizQuestion[]): string {
+  return questions
+    .map((q, i) => {
+      const optionsText = q.options
+        ? `Options: ${q.options.map((o) => `${o.value}. ${o.label}`).join(', ')}`
+        : '';
+      return `Q${i + 1} (${q.type}): ${q.question}\n${optionsText}`;
+    })
+    .join('\n\n');
+}
+
+/**
+ * Process and validate Actions
+ */
+function processActions(
+  actions: Action[],
+  elements: PPTElement[],
+  agents?: AgentInfo[],
+  log: GenerationLogger = noopGenerationLogger,
+): Action[] {
+  const elementIds = new Set(elements.map((el) => el.id));
+  const agentIds = new Set(agents?.map((a) => a.id) || []);
+  const studentAgents = agents?.filter((a) => a.role === 'student') || [];
+  const nonTeacherAgents = agents?.filter((a) => a.role !== 'teacher') || [];
+
+  return actions.map((action) => {
+    // Ensure each action has an ID
+    const processedAction: Action = {
+      ...action,
+      id: action.id || `action_${nanoid(8)}`,
+    };
+
+    // Validate spotlight elementId
+    if (processedAction.type === 'spotlight') {
+      const spotlightAction = processedAction;
+      if (!spotlightAction.elementId || !elementIds.has(spotlightAction.elementId)) {
+        // If elementId is invalid, try selecting the first element
+        if (elements.length > 0) {
+          spotlightAction.elementId = elements[0].id;
+          log.warn(
+            `Invalid elementId, falling back to first element: ${spotlightAction.elementId}`,
+          );
+        }
+      }
+    }
+
+    // Validate/fill discussion agentId
+    if (processedAction.type === 'discussion' && agents && agents.length > 0) {
+      if (processedAction.agentId && agentIds.has(processedAction.agentId)) {
+        // agentId valid — keep it
+      } else {
+        // agentId missing or invalid — pick a random student, or non-teacher, or skip
+        const pool = studentAgents.length > 0 ? studentAgents : nonTeacherAgents;
+        if (pool.length > 0) {
+          const picked = pool[Math.floor(Math.random() * pool.length)];
+          log.warn(
+            `Discussion agentId "${processedAction.agentId || '(none)'}" invalid, assigned: ${picked.id} (${picked.name})`,
+          );
+          processedAction.agentId = picked.id;
+        }
+      }
+    }
+
+    return processedAction;
+  });
+}
+
+/**
+ * Generate default slide Actions (fallback)
+ */
+function generateDefaultSlideActions(outline: SceneOutline, elements: PPTElement[]): Action[] {
+  const actions: Action[] = [];
+
+  // Add spotlight for text elements
+  const textElements = elements.filter((el) => el.type === 'text');
+  if (textElements.length > 0) {
+    actions.push({
+      id: `action_${nanoid(8)}`,
+      type: 'spotlight',
+      title: '聚焦重点',
+      elementId: textElements[0].id,
+    });
+  }
+
+  // Add opening speech based on key points
+  const speechText = outline.keyPoints?.length
+    ? outline.keyPoints.join('。') + '。'
+    : outline.description || outline.title;
+  actions.push({
+    id: `action_${nanoid(8)}`,
+    type: 'speech',
+    title: '场景讲解',
+    text: speechText,
+  });
+
+  return actions;
+}
+
+/**
+ * Generate default quiz Actions (fallback)
+ */
+function generateDefaultQuizActions(_outline: SceneOutline): Action[] {
+  return [
+    {
+      id: `action_${nanoid(8)}`,
+      type: 'speech',
+      title: '测验引导',
+      text: '现在让我们来做一个小测验，检验一下学习成果。',
+    },
+  ];
+}
+
+/**
+ * Generate default interactive Actions (fallback)
+ */
+function generateDefaultInteractiveActions(_outline: SceneOutline): Action[] {
+  return [
+    {
+      id: `action_${nanoid(8)}`,
+      type: 'speech',
+      title: '交互引导',
+      text: '现在让我们通过交互式可视化来探索这个概念。请尝试操作页面中的元素，观察变化。',
+    },
+  ];
 }
