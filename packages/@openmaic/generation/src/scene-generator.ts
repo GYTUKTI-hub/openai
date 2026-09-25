@@ -55,7 +55,7 @@ import type {
   AICallFn,
 } from './pipeline-types.js';
 import { noopGenerationLogger, type GenerationLogger } from './logger.js';
-import { isAbortError } from './generation-retry.js';
+import { isAbortError, withGenerationRetry } from './generation-retry.js';
 import { generatePBLV2ProjectSingleCall } from './pbl/planner-single-call.js';
 import { PlannerV2Error } from './pbl/planner-core.js';
 import type { PBLPlannerV2Input } from './pbl/types.js';
@@ -70,6 +70,68 @@ const INTERACTIVE_WIDGET_ACTIONS = [
   'widget_annotation',
   'widget_reveal',
 ];
+
+/**
+ * Retry budget for a single scene-generation LLM call whose result comes back
+ * empty or fails downstream parsing. Free-tier models (Gemini Flash included)
+ * occasionally return an empty body under load or behind a transient safety
+ * filter hiccup; without this, that single empty response used to fail the
+ * whole scene outright (`generateSceneContent` returns `null` → the route
+ * answers `GENERATION_FAILED` → the scene lands in the "failed" bucket the
+ * classroom UI shows as a card the learner must click to retry by hand).
+ * Retrying automatically here, before that failure ever surfaces, is what
+ * removes the manual click for the common transient case.
+ */
+const EMPTY_RESPONSE_MAX_RETRIES = 2;
+const EMPTY_RESPONSE_BASE_DELAY_MS = 800;
+const EMPTY_RESPONSE_MAX_DELAY_MS = 6000;
+
+/**
+ * Calls the model and validates the raw text BEFORE any downstream parsing is
+ * attempted — the empty/invalid response is checked here, not left for
+ * `JSON.parse` or an HTML/action extractor to trip over further down.
+ *
+ * `isUsable` lets each call site decide what "worth keeping" means: a cheap
+ * non-empty check for calls where an empty fallback path already exists
+ * (action generation degrades to `generateDefault*Actions` on its own), or a
+ * full trial-parse for calls where a bad response has no fallback and would
+ * otherwise fail the whole scene (slide/quiz JSON, interactive HTML).
+ *
+ * Never throws for an exhausted retry budget on a *validation* failure — it
+ * returns the last (still-unusable) response text so the existing
+ * `if (!parsed) { onFailure(); return null }` handling downstream is
+ * unchanged. A genuine transport/provider error (network, 5xx, etc.) still
+ * propagates so the caller's existing catch/log behaviour is preserved.
+ */
+async function callAiWithRetry(
+  aiCall: AICallFn,
+  system: string,
+  user: string,
+  images: Array<{ id: string; src: string }> | undefined,
+  isUsable: (response: string) => boolean,
+  label: string,
+  log: GenerationLogger,
+): Promise<string> {
+  // withGenerationRetry only throws on a genuine transport/provider error or
+  // an abort. When every attempt merely fails `shouldRetryResult` (still
+  // empty/unusable after the retry budget), it resolves to the LAST attempt's
+  // result rather than throwing — so this function always resolves to a
+  // response string, and the existing `if (!parsed) { onFailure(); return
+  // null }` handling at each call site is unchanged for that case.
+  return withGenerationRetry(() => aiCall(system, user, images), {
+    label,
+    maxRetries: EMPTY_RESPONSE_MAX_RETRIES,
+    baseDelayMs: EMPTY_RESPONSE_BASE_DELAY_MS,
+    maxDelayMs: EMPTY_RESPONSE_MAX_DELAY_MS,
+    shouldRetryResult: (response) => !isUsable(response),
+    onRetry: ({ attempt, maxAttempts, nextDelayMs, reason }) => {
+      log.warn(
+        `[${label}] Empty or unusable model response (attempt ${attempt}/${maxAttempts}), ` +
+          `retrying in ${nextDelayMs}ms: ${reason}`,
+      );
+    },
+  });
+}
 
 // ── Options interfaces for scene generation functions ──
 
@@ -772,7 +834,15 @@ async function generateSlideContent(
       `Return the full updated slide content in the same schema.`;
   }
 
-  const response = await aiCall(prompts.system, userPrompt, visionImages);
+  const response = await callAiWithRetry(
+    aiCall,
+    prompts.system,
+    userPrompt,
+    visionImages,
+    (text) => !!text.trim() && parseJsonResponse<GeneratedSlideData>(text) !== null,
+    `slide-content:${outline.title}`,
+    log,
+  );
   const generatedData = parseJsonResponse<GeneratedSlideData>(response);
 
   if (!generatedData || !generatedData.elements || !Array.isArray(generatedData.elements)) {
@@ -881,7 +951,18 @@ async function generateQuizContent(
   }
 
   log.debug(`Generating quiz content for: ${outline.title}`);
-  const response = await aiCall(prompts.system, prompts.user);
+  const response = await callAiWithRetry(
+    aiCall,
+    prompts.system,
+    prompts.user,
+    undefined,
+    (text) => {
+      const parsed = text.trim() ? parseJsonResponse<QuizQuestion[]>(text) : null;
+      return Array.isArray(parsed) && parsed.length > 0;
+    },
+    `quiz-content:${outline.title}`,
+    log,
+  );
   const generatedQuestions = parseJsonResponse<QuizQuestion[]>(response);
 
   if (!generatedQuestions || !Array.isArray(generatedQuestions)) {
@@ -1326,7 +1407,15 @@ export async function generateWidgetContent(
   }
 
   log.info(`Generating ${widgetType} widget for: ${outline.title}`);
-  const response = await aiCall(prompts.system, prompts.user);
+  const response = await callAiWithRetry(
+    aiCall,
+    prompts.system,
+    prompts.user,
+    undefined,
+    (text) => !!text.trim() && extractHtml(text, log) !== null,
+    `interactive-widget:${outline.title}`,
+    log,
+  );
   const html = extractHtml(response, log);
 
   if (!html) {
