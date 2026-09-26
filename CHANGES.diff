@@ -220,7 +220,7 @@ diff -ru /home/claude/repo2/openai-main/packages/@openmaic/generation/src/scene-
      const actions = parseActionsFromStructuredOutput(response, outline.type, undefined, log);
  
      if (actions.length > 0) {
-@@ -1809,7 +1914,15 @@
+@@ -1809,7 +1904,15 @@
        return generateDefaultInteractiveActions(outline);
      }
  
@@ -237,7 +237,7 @@ diff -ru /home/claude/repo2/openai-main/packages/@openmaic/generation/src/scene-
      const actions = parseActionsFromStructuredOutput(
        response,
        outline.type,
-@@ -1844,7 +1957,15 @@
+@@ -1844,7 +1947,15 @@
        return generateDefaultPBLActions(outline);
      }
  
